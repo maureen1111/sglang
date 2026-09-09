@@ -19,7 +19,10 @@ from sglang.kernels.ops.attention.dsv4.compress_old import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
+from sglang.srt.layers.cp.utils import (
+    cp_materialize_global_token_order,
+    cp_materialize_global_token_order_fp8,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import (
@@ -36,6 +39,32 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
+
+
+def _materialize_dsv4_cp_compressor_state(
+    state: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    """Gather compressor state with an optional reduced-width wire format."""
+    comm_dtype = envs.SGLANG_DSV4_CP_COMPRESSOR_COMM_DTYPE.get().lower()
+    if comm_dtype == "fp8":
+        return cp_materialize_global_token_order_fp8(
+            state.contiguous(), forward_batch, torch.cuda.current_stream()
+        )
+    if comm_dtype == "bf16":
+        gathered = cp_materialize_global_token_order(
+            state.to(torch.bfloat16),
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+        return gathered.to(state.dtype)
+    if comm_dtype != "fp32":
+        raise ValueError(
+            "SGLANG_DSV4_CP_COMPRESSOR_COMM_DTYPE must be 'fp32', 'bf16', "
+            f"or 'fp8', got {comm_dtype!r}."
+        )
+    return cp_materialize_global_token_order(
+        state.contiguous(), forward_batch, torch.cuda.current_stream()
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -479,10 +508,8 @@ class Compressor(BaseFusedOp):
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
-            kv_score = cp_materialize_global_token_order(
-                kv_score,
-                forward_batch,
-                torch.cuda.current_stream(),
+            kv_score = _materialize_dsv4_cp_compressor_state(
+                kv_score, forward_batch
             )
         return kv_score
 

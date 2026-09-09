@@ -73,6 +73,56 @@ def prepare_moe_topk(
         log_info_on_rank0(logger, f"Prepared {num_prepared} Waterfill TopK modules.")
 
 
+def prebuild_deepep_v2_buffers(
+    *,
+    model,
+    disaggregation_mode: str,
+    chunked_prefill_size: int,
+    attn_tp_size: int,
+    attn_cp_size: int,
+) -> None:
+    """Collectively build DeepEPv2 buffers before the first user request."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    min_tokens_per_rank = None
+    if (
+        disaggregation_mode == "prefill"
+        and chunked_prefill_size
+        and chunked_prefill_size > 0
+    ):
+        token_partition_size = max(attn_tp_size * attn_cp_size, 1)
+        min_tokens_per_rank = -(-chunked_prefill_size // token_partition_size)
+
+    num_prebuilt = 0
+    for module in model.modules():
+        if not isinstance(module, FusedMoE):
+            continue
+        dispatcher = module.dispatcher
+        if not isinstance(dispatcher, DeepEPv2Dispatcher):
+            continue
+        if (
+            min_tokens_per_rank is not None
+            and dispatcher.num_max_dispatch_tokens_per_rank < min_tokens_per_rank
+        ):
+            raise ValueError(
+                "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                f"{dispatcher.num_max_dispatch_tokens_per_rank} is too small: "
+                f"the per-rank prefill slice requires {min_tokens_per_rank} tokens."
+            )
+        dispatcher.prebuild()
+        num_prebuilt += 1
+
+    if num_prebuilt:
+        log_info_on_rank0(
+            logger, f"Prebuilt {num_prebuilt} DeepEP-V2 dispatcher buffer(s)."
+        )
+
+
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
     from sglang.srt.distributed import get_moe_ep_group

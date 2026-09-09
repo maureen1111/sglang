@@ -23,12 +23,14 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_resources,
 )
 
 logger = logging.getLogger(__name__)
 
 _SCALE_BLOCK_SIZE = 128
+_MXFP8_SCALE_BLOCK_SIZE = 32
 # Must match DeepGEMM's contiguous expert alignment.
 _EXPERT_ALIGNMENT = 128
 _deepep_v2_import_error: Optional[BaseException] = None
@@ -60,6 +62,7 @@ class DeepEPv2DispatchOutput(NamedTuple):
     psum_num_recv_tokens_per_expert: Optional[torch.Tensor] = None
     is_expanded: bool = False
     hidden_states_scale_tma_aligned: bool = False
+    use_mxfp8: bool = False
     use_masked_gemm: bool = False
     expected_m: int = 0
     masked_max_m: int = 0
@@ -116,17 +119,18 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-
-    return get_exec().moe.deepep_v2_mode == "hybrid"
+    return get_exec().moe.deepep_v2_mode == "hybrid" or get_parallel().nnodes > 1
 
 
 def _quantize_for_deepep_v2_dispatch(
-    hidden_states: torch.Tensor, scale_format: DeepEPv2Fp8ScaleFormat
+    hidden_states: torch.Tensor,
+    scale_format: DeepEPv2Fp8ScaleFormat,
+    group_size: int = _SCALE_BLOCK_SIZE,
 ):
     _ensure_fp8_quant_available()
     return sglang_per_token_group_quant_fp8(
         hidden_states,
-        _SCALE_BLOCK_SIZE,
+        group_size,
         column_major_scales=scale_format.tma_aligned,
         scale_tma_aligned=scale_format.tma_aligned,
         scale_ue8m0=scale_format.ue8m0,
@@ -158,11 +162,16 @@ class DeepEPv2Buffer:
         num_max_dispatch_tokens_per_rank: int,
         use_fp8_dispatch: bool,
         allow_hybrid_mode: Optional[bool] = None,
+        allow_multiple_reduction: Optional[bool] = None,
     ) -> ElasticBuffer:
         _ensure_deepep_v2_available()
 
         if allow_hybrid_mode is None:
             allow_hybrid_mode = _get_allow_hybrid_mode()
+        if allow_multiple_reduction is None:
+            allow_multiple_reduction = (
+                envs.SGLANG_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION.get()
+            )
         state = cls._state()
         # A key change rebuilds ElasticBuffer collectively on every rank.
         key = (
@@ -172,6 +181,7 @@ class DeepEPv2Buffer:
             num_max_dispatch_tokens_per_rank,
             use_fp8_dispatch,
             allow_hybrid_mode,
+            allow_multiple_reduction,
             dist.get_world_size(group),
         )
         if state.buffer is not None and state.key == key:
@@ -182,6 +192,12 @@ class DeepEPv2Buffer:
 
         # Communicator reuse requires a device-bound process group.
         os.environ.setdefault("EP_REUSE_NCCL_COMM", "0")
+        gpu_timeout_secs = envs.SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS.get()
+        extra_kwargs = (
+            {"num_gpu_timeout_secs": gpu_timeout_secs}
+            if gpu_timeout_secs > 0
+            else {}
+        )
         buffer = ElasticBuffer(
             group,
             num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
@@ -189,8 +205,10 @@ class DeepEPv2Buffer:
             num_topk=router_topk,
             use_fp8_dispatch=use_fp8_dispatch,
             allow_hybrid_mode=allow_hybrid_mode,
+            allow_multiple_reduction=allow_multiple_reduction,
             sl_idx=0,
             prefer_overlap_with_compute=False,
+            **extra_kwargs,
         )
         # Publish only after collective construction succeeds.
         state.buffer = buffer
@@ -198,13 +216,14 @@ class DeepEPv2Buffer:
         logger.info(
             "Initialized DeepEP v2 ElasticBuffer: world_size=%s hidden_size=%s "
             "num_topk=%s max_dispatch_tokens_per_rank=%s use_fp8_dispatch=%s "
-            "allow_hybrid_mode=%s num_bytes=%s",
+            "allow_hybrid_mode=%s allow_multiple_reduction=%s num_bytes=%s",
             dist.get_world_size(group),
             hidden_size,
             router_topk,
             num_max_dispatch_tokens_per_rank,
             use_fp8_dispatch,
             allow_hybrid_mode,
+            allow_multiple_reduction,
             buffer.num_bytes,
         )
         return buffer
@@ -237,6 +256,30 @@ class _DeepEPv2Impl:
         self.rank = dist.get_rank(group)
         self._handle = None
         self._pad_empty_combine = False
+        self._prefill_expand_enabled = (
+            envs.SGLANG_DEEPEP_V2_PREFILL_DO_EXPAND.get()
+        )
+        self._use_mxfp8_dispatch = envs.SGLANG_DEEPEP_V2_MXFP8_DISPATCH.get()
+        if self._use_mxfp8_dispatch and not (
+            self.scale_format.ue8m0 and self.scale_format.tma_aligned
+        ):
+            raise RuntimeError(
+                "DeepEP v2 MXFP8 dispatch requires packed UE8M0 TMA-aligned "
+                "activation scales from DeepGEMM"
+            )
+        try:
+            self.combine_num_sms = int(
+                os.environ.get("SGLANG_DEEPEP_V2_COMBINE_NUM_SMS", "0")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "SGLANG_DEEPEP_V2_COMBINE_NUM_SMS must be an integer"
+            ) from exc
+        if self.combine_num_sms < 0:
+            raise ValueError(
+                "SGLANG_DEEPEP_V2_COMBINE_NUM_SMS must be non-negative"
+            )
+        self.overlap_args = None
 
     def _destroy_handle(self) -> None:
         self._handle = None
@@ -249,6 +292,10 @@ class _DeepEPv2Impl:
             self.num_max_dispatch_tokens_per_rank,
             True,
         )
+
+    def prebuild_buffer(self) -> None:
+        """Collectively allocate the shared ElasticBuffer before first request."""
+        self._get_buffer()
 
     def _validate_common(
         self, hidden_states: torch.Tensor, topk_ids: torch.Tensor
@@ -288,9 +335,10 @@ class _DeepEPv2Impl:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        # Decode uses expanded/masked layout; extend uses contiguous in both modes.
-        use_expand_layout = not get_is_extend_in_batch()
-        use_masked = use_expand_layout
+        is_decode = not get_is_extend_in_batch()
+        use_masked = is_decode
+        use_expand_layout = is_decode or self._prefill_expand_enabled
+        use_mxfp8_this_batch = self._use_mxfp8_dispatch and not is_decode
 
         # CPU-synced dispatch needs a dummy token to notify from an idle rank.
         self._pad_empty_combine = (not use_masked) and hidden_states.shape[0] == 0
@@ -303,11 +351,16 @@ class _DeepEPv2Impl:
             topk_weights = topk_weights.new_zeros((1, topk_weights.shape[-1]))
 
         _ensure_fp8_quant_available()
-        if use_masked:
+        scale_block_size = (
+            _MXFP8_SCALE_BLOCK_SIZE
+            if use_mxfp8_this_batch
+            else _SCALE_BLOCK_SIZE
+        )
+        if use_expand_layout:
             _ue8m0 = self.scale_format.ue8m0
             dispatch_x = sglang_per_token_group_quant_fp8(
                 hidden_states,
-                _SCALE_BLOCK_SIZE,
+                scale_block_size,
                 column_major_scales=_ue8m0,
                 scale_tma_aligned=_ue8m0,
                 scale_ue8m0=_ue8m0,
@@ -315,7 +368,7 @@ class _DeepEPv2Impl:
             use_tma_aligned_col_major_sf = _ue8m0
         else:
             dispatch_x = _quantize_for_deepep_v2_dispatch(
-                hidden_states, self.scale_format
+                hidden_states, self.scale_format, scale_block_size
             )
             use_tma_aligned_col_major_sf = self.scale_format.tma_aligned
 
@@ -327,6 +380,11 @@ class _DeepEPv2Impl:
             do_cpu_sync_val = False
 
         buffer = self._get_buffer()
+        num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
+        if num_sms <= 0:
+            num_sms = buffer.get_theoretical_num_sms(
+                self.num_experts, self.router_topk
+            )
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
             dispatch_x,
             topk_idx=topk_ids,
@@ -334,7 +392,7 @@ class _DeepEPv2Impl:
             num_experts=self.num_experts,
             num_max_tokens_per_rank=num_max_tokens,
             expert_alignment=_EXPERT_ALIGNMENT,
-            num_sms=envs.SGLANG_DEEPEP_V2_NUM_SMS.get(),
+            num_sms=num_sms,
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
@@ -388,6 +446,7 @@ class _DeepEPv2Impl:
             handle.psum_num_recv_tokens_per_expert,
             use_expand_layout,
             use_tma_aligned_col_major_sf,
+            use_mxfp8_this_batch,
             use_masked,
             expected_m,
             masked_max_m,
@@ -403,13 +462,44 @@ class _DeepEPv2Impl:
         # Release the single-use handle even when combine fails.
         try:
             buffer = self._get_buffer()
-            combined_x, _, event = buffer.combine(
-                combine_input.hidden_states,
-                handle=self._handle,
-                topk_weights=combine_input.topk_weights,
-            )
-            if event.event is not None:
-                event.current_stream_wait()
+            overlap_args = self.overlap_args
+            if overlap_args is None:
+                combined_x, _, event = buffer.combine(
+                    combine_input.hidden_states,
+                    handle=self._handle,
+                    topk_weights=combine_input.topk_weights,
+                    num_sms=self.combine_num_sms,
+                )
+                if event.event is not None:
+                    event.current_stream_wait()
+            else:
+                if overlap_args.overlap:
+                    raise NotImplementedError(
+                        "DeepEP v2 only supports combine/shared-expert SBO; "
+                        "down-GEMM/combine signal overlap is not implemented"
+                    )
+
+                compute_stream = torch.cuda.current_stream()
+                combine_stream = overlap_args.stream
+                combine_stream.wait_event(overlap_args.wait_event)
+                combine_input.hidden_states.record_stream(combine_stream)
+                if combine_input.topk_weights is not None:
+                    combine_input.topk_weights.record_stream(combine_stream)
+
+                with torch.cuda.stream(combine_stream):
+                    combined_x, _, event = buffer.combine(
+                        combine_input.hidden_states,
+                        handle=self._handle,
+                        topk_weights=combine_input.topk_weights,
+                        num_sms=self.combine_num_sms,
+                        async_with_compute_stream=True,
+                        allocate_on_comm_stream=True,
+                    )
+                    if event.event is not None:
+                        event.current_stream_wait()
+
+                compute_stream.wait_stream(combine_stream)
+                combined_x.record_stream(compute_stream)
             if self._pad_empty_combine:
                 combined_x = combined_x[:0]
             return combined_x
@@ -459,3 +549,14 @@ class DeepEPv2Dispatcher(BaseDispatcher):
                 f"Expected DeepEP v2 combine input, got {combine_input.format}"
             )
         return self._impl.combine(combine_input)
+
+    def set_overlap_args(self, combine_overlap_args, meta_overlap_args) -> None:
+        super().set_overlap_args(combine_overlap_args, meta_overlap_args)
+        self._impl.overlap_args = combine_overlap_args
+
+    def clear_overlap_args(self) -> None:
+        super().clear_overlap_args()
+        self._impl.overlap_args = None
+
+    def prebuild(self) -> None:
+        self._impl.prebuild_buffer()

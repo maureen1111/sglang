@@ -251,7 +251,11 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
     elif quant_method.use_mxfp8:
         reason = "selected MXFP8 weights"
     elif quant_method.is_fp4_expert:
-        reason = "selected FP4 experts"
+        # DeepEP v2 only defines the activation dispatch format. DeepGEMM's
+        # SM120 W4A8 path consumes that FP8 activation together with the
+        # checkpoint's FP4 weights and their (1, 32) scales.
+        if not get_moe_runner_backend().is_deep_gemm():
+            reason = "selected FP4 experts without the DeepGEMM runner"
     elif list(quant_method.weight_block_size or []) != [128, 128]:
         reason = f"has weight_block_size={quant_method.weight_block_size}"
     elif config.activation_scheme != "dynamic":

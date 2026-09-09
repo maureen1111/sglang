@@ -1267,6 +1267,7 @@ def ep_scatter_from_psum(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
+    expert_start: int = 0,
 ):
     BLOCK_E = 128
     BLOCK_D = 128
@@ -1315,6 +1316,8 @@ def ep_scatter_from_psum(
         output_index,
         output_index.stride(0),
         output_index.stride(1),
+        expert_start,
+        num_experts,
         topk_num=recv_topk.shape[1],
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
@@ -2566,6 +2569,123 @@ def masked_slab_to_expand(
         num_warps=4,
     )
     return output_tensor
+
+
+@triton.jit
+def _fwd_kernel_fill_m_indices_from_psum(
+    psum_ptr,
+    m_indices_ptr,
+    total_rows,
+    num_local_experts,
+    ALIGN: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # psum is the alignment-padded exclusive prefix sum. Padding rows retain
+    # their expert id so every row is valid input to the contiguous GEMM.
+    expert = tl.program_id(0)
+    prev_end = tl.load(psum_ptr + expert - 1, mask=expert > 0, other=0)
+    start = ((prev_end + ALIGN - 1) // ALIGN) * ALIGN
+    end = tl.load(psum_ptr + expert)
+    segment_end = ((end + ALIGN - 1) // ALIGN) * ALIGN
+    if expert == num_local_experts - 1:
+        segment_end = total_rows
+    count = segment_end - start
+    offsets = tl.arange(0, BLOCK_M)
+    for base in tl.range(0, count, BLOCK_M):
+        row = start + base + offsets
+        tl.store(
+            m_indices_ptr + row,
+            expert,
+            mask=(base + offsets < count) & (row < total_rows),
+        )
+
+
+@torch.no_grad()
+def fill_m_indices_from_psum(
+    psum_num_recv_tokens_per_expert: torch.Tensor,
+    num_local_experts: int,
+    total_rows: int,
+    expert_alignment: int,
+) -> torch.Tensor:
+    """Build contiguous-GEMM row labels directly from DeepEP's device psum."""
+    m_indices = torch.empty(
+        (total_rows,),
+        device=psum_num_recv_tokens_per_expert.device,
+        dtype=torch.int32,
+    )
+    _fwd_kernel_fill_m_indices_from_psum[(num_local_experts,)](
+        psum_num_recv_tokens_per_expert,
+        m_indices,
+        total_rows,
+        num_local_experts,
+        ALIGN=expert_alignment,
+        BLOCK_M=128,
+        num_warps=4,
+    )
+    return m_indices
+
+
+@triton.jit
+def _fwd_kernel_scale_expanded_rows(
+    x_ptr,
+    x_stride0,
+    x_stride1,
+    weight_ptr,
+    HIDDEN: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    HIDDEN_IS_MULTIPLE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    block = tl.program_id(1)
+    offsets = block * BLOCK_H + tl.arange(0, BLOCK_H)
+    base = x_ptr + row * x_stride0 + offsets * x_stride1
+    weight = tl.load(weight_ptr + row).to(tl.float32)
+
+    if HIDDEN_IS_MULTIPLE:
+        value = tl.load(base)
+        tl.store(base, (value.to(tl.float32) * weight).to(value.dtype))
+    else:
+        mask = offsets < HIDDEN
+        value = tl.load(base, mask=mask)
+        tl.store(
+            base,
+            (value.to(tl.float32) * weight).to(value.dtype),
+            mask=mask,
+        )
+
+
+@torch.no_grad()
+def scale_expanded_rows_(
+    x: torch.Tensor,
+    row_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Apply one routing weight to each expanded row in place."""
+    assert x.dim() == 2, f"expected 2D x, got {tuple(x.shape)}"
+    rows, hidden = x.shape
+    assert row_weights.numel() >= rows, (
+        f"row_weights has {row_weights.numel()} entries but x has {rows} rows"
+    )
+    if rows == 0:
+        return x
+
+    weights = row_weights.reshape(-1)
+    if weights.dtype != torch.float32:
+        weights = weights.to(torch.float32)
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+
+    block_h = 2048 if hidden >= 2048 else triton.next_power_of_2(hidden)
+    _fwd_kernel_scale_expanded_rows[(rows, ceil_div(hidden, block_h))](
+        x,
+        x.stride(0),
+        x.stride(1),
+        weights,
+        HIDDEN=hidden,
+        BLOCK_H=block_h,
+        HIDDEN_IS_MULTIPLE=(hidden % block_h == 0),
+        num_warps=4,
+    )
+    return x
 
 
 def _moe_permute_rows(

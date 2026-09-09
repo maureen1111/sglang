@@ -214,11 +214,16 @@ def handle_a2a_moe(server_args: Any):
                 "Add a runner adapter before enabling DeepEP v2 with other "
                 "MoE runners."
             )
-        if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+        if cfg.enable_two_batch_overlap:
             raise ValueError(
-                "DeepEP v2 MoE has not implemented the TBO/SBO overlap hooks yet. "
-                "Disable --enable-two-batch-overlap and "
-                "--enable-single-batch-overlap when using --moe-a2a-backend deepep_v2."
+                "DeepEP v2 MoE has not implemented TBO overlap hooks yet. "
+                "Disable --enable-two-batch-overlap when using "
+                "--moe-a2a-backend deepep_v2."
+            )
+        if cfg.enable_single_batch_overlap and not get_platform().is_blackwell:
+            raise ValueError(
+                "DeepEP v2 SBO currently supports only the Blackwell "
+                "combine/shared-expert overlap path."
             )
         if cfg.enforce_shared_experts_fusion:
             raise ValueError(
@@ -394,9 +399,14 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
     capacity = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
     if view.disaggregation_mode != "decode":
+        # The DP-local chunk is partitioned across all attention ranks before
+        # DeepEP dispatch. This includes CP ranks in the supported CP+DP grid.
+        attn_dp_size = view.dp_size if view.enable_dp_attention else 1
+        token_partition_size = max(1, view.tp_size // attn_dp_size)
         prefill_tokens = max_prefill_buffer_tokens(server_args) or (
             view.max_prefill_tokens or 0
         )
+        prefill_tokens = -(-prefill_tokens // token_partition_size)
         if prefill_tokens > capacity:
             raise ValueError(
                 "DeepEP v2 per-rank prefill budget exceeds "

@@ -193,18 +193,30 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         "validate_deepseek_v4_cp",
         moe_dense_tp_size=1,
     )
+    attn_cp_size = cfg.tp_size // cfg.dp_size
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
-        attn_cp_size=cfg.tp_size // cfg.dp_size,
+        attn_cp_size=attn_cp_size,
     )
-    assert cfg.dp_size == 1, (
-        "For round-robin split mode, dp attention is not supported."
-    )
+    attn_tp_size = cfg.tp_size // cfg.dp_size // attn_cp_size
+    if cfg.dp_size > 1 and attn_tp_size != 1:
+        raise ValueError(
+            "DeepSeekV4 interleave CP with DP attention currently requires "
+            "attention TP size 1; got "
+            f"tp_size={cfg.tp_size}, dp_size={cfg.dp_size}, "
+            f"attn_cp_size={attn_cp_size}, attn_tp_size={attn_tp_size}."
+        )
     assert cfg.tp_size <= 8, (
         "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
     )
-    supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
+    supported_a2a_backends = (
+        "none",
+        "deepep",
+        "deepep_v2",
+        "megamoe",
+        "mori",
+    )
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "

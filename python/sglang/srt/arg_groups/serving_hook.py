@@ -436,13 +436,13 @@ def handle_environment_variables(server_args: Any):
         explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
         supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and get_platform().is_sm90
+            and (get_platform().is_sm90 or get_platform().is_sm120)
             and explicit
         )
         if not supported and explicit:
             logger.warning(
                 "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires DeepGEMM JIT "
-                "and sm100+ (Blackwell), or explicit opt-in on sm90; "
+                "and sm100+ (Blackwell), or explicit opt-in on sm90/sm120; "
                 "detected sm%d.",
                 sm,
             )

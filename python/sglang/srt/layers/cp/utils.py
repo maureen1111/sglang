@@ -17,6 +17,8 @@
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+import torch
+
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -272,6 +274,40 @@ def cp_materialize_global_token_order(
     )
 
 
+def cp_materialize_global_token_order_fp8(
+    x: Any, forward_batch, stream: Optional[Any] = None
+):
+    """Materialize a floating-point CP tensor using E4M3 wire compression.
+
+    A single FP32 scale is stored per token. The scale bytes are appended to
+    the uint8 FP8 payload so the CP path still issues only one all-gather.
+    """
+    if not isinstance(x, torch.Tensor) or not x.is_floating_point():
+        raise TypeError("FP8 CP materialization requires a floating-point tensor.")
+    if x.ndim < 2:
+        raise ValueError("FP8 CP materialization requires a token-major tensor.")
+
+    original_dtype = x.dtype
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+    x_fp32 = x.float()
+    absmax = x_fp32.abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(absmax > 0, absmax / fp8_max, torch.ones_like(absmax))
+    quantized = (
+        (x_fp32 / scale)
+        .clamp(min=-fp8_max, max=fp8_max)
+        .to(fp8_dtype)
+        .view(torch.uint8)
+    )
+    packed = torch.cat((quantized, scale.contiguous().view(torch.uint8)), dim=-1)
+    gathered = cp_materialize_global_token_order(packed, forward_batch, stream)
+
+    scale_nbytes = 4
+    gathered_quantized = gathered[..., :-scale_nbytes].contiguous().view(fp8_dtype)
+    gathered_scale = gathered[..., -scale_nbytes:].contiguous().view(torch.float32)
+    return (gathered_quantized.float() * gathered_scale).to(original_dtype)
+
+
 @contextmanager
 def cp_shard_model_inputs(
     complete_hidden_states: Any,
@@ -328,6 +364,7 @@ __all__ = [
     "is_cp_v2_active",
     "cp_gather_after_forward",
     "cp_materialize_global_token_order",
+    "cp_materialize_global_token_order_fp8",
     "cp_round_robin_input_ids_v2",
     "cp_shard_hidden_states",
     "cp_shard_model_inputs",

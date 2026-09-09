@@ -291,11 +291,22 @@ def _run_mega_routed(
         device=hidden_states.device,
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
+    # OffloaderV2 swaps the named weights and scales with prefetched device
+    # tensors for this functional call. Read the live parameters here so
+    # MegaMoE consumes the tensors selected by the offloader.
+    l1_weights = (
+        moe.experts.w13_weight,
+        moe.experts.w13_weight_scale_inv,
+    )
+    l2_weights = (
+        moe.experts.w2_weight,
+        moe.experts.w2_weight_scale_inv,
+    )
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         deep_gemm.fp8_fp4_mega_moe(
             y,
-            moe.experts.mega_l1_weights,
-            moe.experts.mega_l2_weights,
+            l1_weights,
+            l2_weights,
             buf,
             recipe=(1, 1, 32),
             activation="swiglu",
@@ -316,14 +327,49 @@ def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor
     half = n // 2
     gate = t[:, :half].reshape(num_groups, half // gran, gran, *rest)
     up = t[:, half:].reshape(num_groups, half // gran, gran, *rest)
+
+    if gran == 8 and t.is_cuda:
+        # FP8xFP4 only permutes contiguous gran-8 blocks.  Do the transpose of
+        # [gate blocks, up blocks] into [gate0, up0, ...] in place, using one
+        # block as scratch.  The previous out-of-place path briefly needed a
+        # second full expert-weight tensor, which can exceed 72 GiB cards while
+        # model weights are being post-processed.
+        blocks = t.view(num_groups, n // gran, gran, *rest)
+        num_half_blocks = half // gran
+        permutation = [
+            index // 2 if index % 2 == 0 else num_half_blocks + index // 2
+            for index in range(num_half_blocks * 2)
+        ]
+        visited = [False] * len(permutation)
+        for start in range(len(permutation)):
+            if visited[start] or permutation[start] == start:
+                visited[start] = True
+                continue
+            scratch = blocks[:, start].clone()
+            current = start
+            while True:
+                visited[current] = True
+                source = permutation[current]
+                if source == start:
+                    blocks[:, current].copy_(scratch)
+                    break
+                blocks[:, current].copy_(blocks[:, source])
+                current = source
+        return t
+
+    output = torch.empty_like(t)
     if gran == 16:
-        result = torch.cat(
-            [gate[:, :, 0::2], up[:, :, 0::2], gate[:, :, 1::2], up[:, :, 1::2]],
-            dim=2,
-        ).reshape(num_groups, n, *rest)
+        output_view = output.view(num_groups, half // gran, gran * 2, *rest)
+        half_gran = gran // 2
+        output_view[:, :, 0:half_gran].copy_(gate[:, :, 0::2])
+        output_view[:, :, half_gran:gran].copy_(up[:, :, 0::2])
+        output_view[:, :, gran : gran + half_gran].copy_(gate[:, :, 1::2])
+        output_view[:, :, gran + half_gran :].copy_(up[:, :, 1::2])
     else:
-        result = torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
-    return torch.empty_like(t).copy_(result)
+        output_view = output.view(num_groups, half // gran, 2, gran, *rest)
+        output_view[:, :, 0].copy_(gate)
+        output_view[:, :, 1].copy_(up)
+    return output
 
 
 def _interleave_mega_moe_l1_weights(
@@ -384,12 +430,10 @@ def build_mega_moe_experts_weights(experts) -> None:
         disable_ue8m0_cast=False,
     )
 
-    # Build the interleaved L1 weight + scale once; share the weight buffer
-    # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
-    # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
-    # the deep-ep path consumes the non-transposed interleaved scale and a
-    # swizzle-aware activation kernel. L2 weight is untouched by the mega
-    # transform, so the existing `w2_weight.data` is shared directly.
+    # Build the interleaved L1 weight + scale once.  This function is only
+    # entered for the MegaMoE backend, so retain its UTCCP scale layout as the
+    # canonical parameter instead of keeping an unused fallback-layout copy
+    # for every layer.
     w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
         (w13, w13_sf), mma_type
     )
@@ -397,12 +441,19 @@ def build_mega_moe_experts_weights(experts) -> None:
     w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
 
     experts.w13_weight.data = w13_interleaved
-    experts.w13_weight_scale_inv.data = w13_sf_interleaved
-    experts.w2_weight_scale_inv.data = w2_sf
+    experts.w13_weight_scale_inv.data = w13_sf_utccp
+    experts.w2_weight_scale_inv.data = w2_sf_utccp
     experts.w13_weight_scale_inv.format_ue8m0 = True
     experts.w2_weight_scale_inv.format_ue8m0 = True
 
-    experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
-    experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
+    if _device_sm == 90:
+        experts.mega_l1_weights = (
+            experts.w13_weight.data,
+            experts.w13_weight_scale_inv.data,
+        )
+        experts.mega_l2_weights = (
+            experts.w2_weight.data,
+            experts.w2_weight_scale_inv.data,
+        )
 
     experts._mega_moe_weights_built = True

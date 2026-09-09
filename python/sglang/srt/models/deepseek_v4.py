@@ -62,6 +62,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
+    cp_materialize_global_token_order_fp8,
     cp_round_robin_input_ids_v2,
     is_cp_v2_active,
 )
@@ -245,7 +246,39 @@ def _get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
+
+def _materialize_dsv4_cp_kv(
+    kv: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    comm_dtype = envs.SGLANG_DSV4_CP_KV_COMM_DTYPE.get().lower()
+    if comm_dtype == "fp8":
+        return cp_materialize_global_token_order_fp8(
+            kv.contiguous(), forward_batch, torch.cuda.current_stream()
+        )
+    if comm_dtype != "bf16":
+        raise ValueError(
+            "SGLANG_DSV4_CP_KV_COMM_DTYPE must be 'bf16' or 'fp8', "
+            f"got {comm_dtype!r}."
+        )
+    return cp_materialize_global_token_order(
+        kv.contiguous(), forward_batch, torch.cuda.current_stream()
+    )
+
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+
+
+@functools.lru_cache(maxsize=1)
+def _wo_a_ue8m0_sm12x() -> bool:
+    """Use the UE8M0 scale layout required by SM12x DeepGEMM wo_a."""
+    if not _FP8_WO_A_GEMM:
+        return False
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        return False
+    return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and is_sm120_supported()
+
+
 _MHC_POST_MULT_VALUE = 2.0
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
 
@@ -743,7 +776,7 @@ class MqaAttentionBase(nn.Module):
                 "FP8 quant_config must create weight_scale_inv"
             )
             self.wo_a.weight_scale_inv.format_ue8m0 = (
-                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x()
             )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
@@ -1469,11 +1502,7 @@ class MQALayer(MqaAttentionBase):
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                kv = _materialize_dsv4_cp_kv(kv, forward_batch)
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
@@ -1530,20 +1559,12 @@ class MQALayer(MqaAttentionBase):
                         )
                         kv = None
                     else:
-                        kv = cp_materialize_global_token_order(
-                            kv.contiguous(),
-                            forward_batch,
-                            torch.cuda.current_stream(),
-                        )
+                        kv = _materialize_dsv4_cp_kv(kv, forward_batch)
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                kv = _materialize_dsv4_cp_kv(kv, forward_batch)
                 attn_backend.store_cache(
                     layer_id=self.layer_id,
                     swa_k=kv,
@@ -1759,8 +1780,8 @@ class MQALayer(MqaAttentionBase):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x():
+                # sm100 and sm12x use UE8M0 scales through the dedicated JIT kernel.
                 o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
                 recipe = (1, 1, 128)
             else:
@@ -2383,10 +2404,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
+                    or moe_a2a_backend.is_deepep_v2()
                     or moe_a2a_backend.is_megamoe()
                     or moe_a2a_backend.is_mori()
                 ), (
-                    "CP requires moe_a2a_backend in ('deepep', 'megamoe', 'mori'), "
+                    "CP requires moe_a2a_backend in "
+                    "('deepep', 'deepep_v2', 'megamoe', 'mori'), "
                     f"got {moe_a2a_backend.value!r}."
                 )
         elif _use_tp_moe_gather:
@@ -2843,6 +2866,31 @@ class DeepseekV4Model(nn.Module):
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            offloader_kwargs=dict(
+                submodule_accessor=lambda layer: (
+                    layer.mlp.experts
+                    if isinstance(layer.mlp, deepseek_v2.DeepseekV2MoE)
+                    else layer.mlp
+                ),
+                whitelist_param_names_creator=lambda module: (
+                    [
+                        "w13_weight",
+                        "w2_weight",
+                        "w13_weight_scale_inv",
+                        "w2_weight_scale_inv",
+                        *(
+                            [
+                                "w13_blockscale_swizzled",
+                                "w2_blockscale_swizzled",
+                            ]
+                            if hasattr(module, "w13_blockscale_swizzled")
+                            else []
+                        ),
+                    ]
+                    if isinstance(module, FusedMoE)
+                    else []
+                ),
+            ),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -3464,7 +3512,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from sglang.srt.layers import deep_gemm_wrapper
 
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x():
             from deep_gemm import transform_sf_into_required_layout
 
         if is_nextn:
@@ -3481,7 +3529,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             D = attn.wo_a.weight.shape[1]
 
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
-            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x():
                 attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
                     raw_scale,
                     mn=R,

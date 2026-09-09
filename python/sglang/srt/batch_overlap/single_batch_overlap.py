@@ -87,8 +87,6 @@ def compute_overlap_args(dispatch_output, alt_stream):
 
     hidden_states = dispatch_output.hidden_states
 
-    num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
-
     total_num_sms = torch.cuda.get_device_properties(
         device="cuda"
     ).multi_processor_count
@@ -113,6 +111,12 @@ def compute_overlap_args(dispatch_output, alt_stream):
     down_gemm_overlap_args = None
 
     if SboFlags.enable_combine_down_gemm_two_stream_overlap():
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                "Down-GEMM/combine overlap requires expert-major dispatch output "
+                f"with rank 3, got shape={tuple(hidden_states.shape)}"
+            )
+        num_local_experts, num_tokens_static, _ = hidden_states.shape
         # TODO use zero_allocator to remove this `torch.zeros` call
         # NOTE ours v2 use uint32 not int32 currently
         if is_blackwell():

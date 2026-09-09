@@ -676,6 +676,12 @@ class Envs:
     # Distributed and model-parallel runtime
     # ===================================================================
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
+    # Compress DeepSeek-V4 CP KV communication with per-token E4M3 scaling.
+    # Supported values: "bf16" (default) and "fp8".
+    SGLANG_DSV4_CP_KV_COMM_DTYPE = EnvStr("bf16")
+    # Compress DeepSeek-V4 compressor-state CP communication. Keep the stock
+    # FP32 wire format by default; "bf16" and per-token E4M3 "fp8" are opt-in.
+    SGLANG_DSV4_CP_COMPRESSOR_COMM_DTYPE = EnvStr("fp32")
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
@@ -1115,6 +1121,33 @@ class Envs:
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
+    # Prefill can use DeepEP's expert-expanded receive layout and avoid a
+    # separate full-hidden ep_scatter pass before the grouped GEMM.
+    SGLANG_DEEPEP_V2_PREFILL_DO_EXPAND = EnvBool(True)
+    # Quantize DeepEP v2 activations as native MXFP8 (32 values per UE8M0
+    # scale) and preserve that layout through the DeepGEMM FP4 expert path.
+    SGLANG_DEEPEP_V2_MXFP8_DISPATCH = EnvBool(False)
+    # Keep DeepEP v2 combine aligned with the vLLM prefill profile: each
+    # dispatched expert slot is returned and reduced by the combine kernel.
+    SGLANG_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION = EnvBool(True)
+    # GPU-side ElasticBuffer barrier timeout in seconds. Zero keeps DeepEP's
+    # default timeout.
+    SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS = EnvInt(0)
+    # Reuse a fixed GPU buffer ring for CPU-offloaded weights instead of
+    # allocating a fresh device tensor on every layer prefetch.
+    SGLANG_OFFLOAD_STATIC_BUFFER_RING = EnvBool(False)
+    # Bind offloaded parameters directly to the static GPU buffer ring and
+    # synchronize H2D prefetches with per-layer CUDA events. This avoids the
+    # functional_call parameter swap on every layer.
+    SGLANG_OFFLOAD_DIRECT_STATIC_PREFETCH = EnvBool(False)
+    # Pack each offloaded module's contiguous parameters into one pinned CPU
+    # slab and mirror it with one GPU slab. This turns several small H2D copies
+    # (for example w13, w2 and their scales) into one larger transfer.
+    SGLANG_OFFLOAD_CONTIGUOUS_SLAB = EnvBool(False)
+    # Chunk and pace wraparound prefetches for the next forward so low-priority
+    # weight copies do not monopolize PCIe during the current forward tail.
+    SGLANG_OFFLOAD_PACED_TAIL_COPY = EnvBool(False)
+    SGLANG_OFFLOAD_TAIL_COPY_CHUNK_MB = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)

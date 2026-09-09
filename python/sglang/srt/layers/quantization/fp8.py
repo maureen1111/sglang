@@ -2548,6 +2548,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.runner.runner_backend.is_deep_gemm():
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
+            use_deepep_v2_mxfp8 = (
+                self.is_fp4_expert
+                and get_moe_a2a_backend().is_deepep_v2()
+                and getattr(dispatch_output, "use_mxfp8", False)
+            )
 
             if self.block_quant:
                 block_shape = self.quant_config.weight_block_size
@@ -2579,9 +2584,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
-                block_shape=block_shape,
+                block_shape=[1, 32] if use_deepep_v2_mxfp8 else block_shape,
                 is_fp4_experts=self.is_fp4_expert,
-                use_mxfp8=self.use_mxfp8,
+                use_mxfp8=self.use_mxfp8 or use_deepep_v2_mxfp8,
             )
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()

@@ -1534,14 +1534,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # carry topk_ids/topk_weights directly and have no `.topk_output`.
             from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 
+            use_deepep_v2_mxfp8 = (
+                DispatchOutputChecker.format_is_deepep_v2(dispatch_output)
+                and getattr(dispatch_output, "use_mxfp8", False)
+            )
+
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 use_fp8=True,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
-                block_shape=[128, 128],
+                block_shape=[1, 32] if use_deepep_v2_mxfp8 else [128, 128],
                 is_fp4_experts=True,
+                use_mxfp8=use_deepep_v2_mxfp8,
             )
             return self.runner.run(dispatch_output, quant_info)
 

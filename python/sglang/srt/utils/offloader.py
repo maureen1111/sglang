@@ -1,11 +1,13 @@
 import logging
 import os
+import threading
 from abc import ABC
 from typing import Callable, Generator, List, Optional
 
 import torch
 from torch.func import functional_call
 
+from sglang.srt.environ import envs
 from sglang.srt.distributed.naive_distributed import (
     NaiveDistributed,
     get_naive_distributed,
@@ -23,8 +25,15 @@ from sglang.srt.utils.host_shared_memory import (
     get_host_shared_memory_manager,
     set_host_shared_memory_manager,
 )
+from sglang.srt.utils.offload_tail_copy import (
+    TailCopyJob,
+    TailCopyScheduler,
+    iter_chunked_tensor_views,
+)
 
 logger = logging.getLogger(__name__)
+
+_OFFLOAD_SLAB_ALIGNMENT_BYTES = 256
 
 _SubmoduleAccessor = Callable[[torch.nn.Module], torch.nn.Module]
 _WhitelistParamNamesCreator = Callable[[torch.nn.Module], List[str]]
@@ -202,6 +211,11 @@ class OffloaderV2(BaseOffloader):
         # stream — sharing the models' "alt" overlap stream would serialize
         # unrelated copy and compute work.
         alt_stream = get_stream("offload")
+        tail_copy_scheduler = None
+        if envs.SGLANG_OFFLOAD_PACED_TAIL_COPY.get():
+            tail_copy_scheduler = TailCopyScheduler(
+                device=torch.cuda.current_device(), copy_stream=alt_stream
+            )
 
         all_modules = []
         offload_submodules = []
@@ -220,15 +234,20 @@ class OffloaderV2(BaseOffloader):
                         module=submodule,
                         alt_stream=alt_stream,
                         whitelist_param_names=whitelist_param_names,
+                        module_index=len(self.offloaders),
+                        tail_copy_scheduler=tail_copy_scheduler,
                     )
                 )
 
+        prefetch_after = _build_slot_prefetch_schedule(
+            len(offload_submodules), self.prefetch_step
+        )
         for index, module in enumerate(offload_submodules):
             _hook_module_forward_for_offloader(
                 index=index,
                 module=module,
                 offloaders=self.offloaders,
-                prefetch_step=self.prefetch_step,
+                next_index=prefetch_after[index],
             )
 
         return all_modules
@@ -237,26 +256,115 @@ class OffloaderV2(BaseOffloader):
         for offloader in self.offloaders:
             offloader.post_init()
 
-        for i in range(self.prefetch_step):
+        use_direct_static_prefetch = (
+            self.mode == "cpu"
+            and envs.SGLANG_OFFLOAD_DIRECT_STATIC_PREFETCH.get()
+        )
+        if self.mode == "cpu" and (
+            envs.SGLANG_OFFLOAD_STATIC_BUFFER_RING.get()
+            or use_direct_static_prefetch
+        ):
+            self._assign_static_buffer_ring(
+                direct_parameter_binding=use_direct_static_prefetch
+            )
+
+        for i in range(min(self.prefetch_step, len(self.offloaders))):
             self.offloaders[i].start_onload()
+
+    def _assign_static_buffer_ring(self, direct_parameter_binding: bool = False):
+        if not self.offloaders:
+            return
+
+        pools = {}
+        allocated_bytes = 0
+        slot_count = min(self.prefetch_step, len(self.offloaders))
+        for index, offloader in enumerate(self.offloaders):
+            signature = offloader.parameter_signature()
+            key = (signature, index % slot_count)
+            device_buffers = pools.get(key)
+            if device_buffers is None:
+                device_buffers = offloader.allocate_static_device_tensors()
+                pools[key] = device_buffers
+                device_tensors, device_slab = device_buffers
+                allocated_bytes += (
+                    device_slab.numel() * device_slab.element_size()
+                    if device_slab is not None
+                    else sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in device_tensors.values()
+                    )
+                )
+            device_tensors, device_slab = device_buffers
+            offloader.assign_static_device_tensors(
+                device_tensors,
+                device_slab=device_slab,
+                direct_parameter_binding=direct_parameter_binding,
+            )
+
+        logger.info(
+            "[offloader] enabled static GPU buffer ring: modules=%s slots=%s "
+            "layouts=%s allocated_bytes=%s direct_parameter_binding=%s",
+            len(self.offloaders),
+            slot_count,
+            len(pools),
+            allocated_bytes,
+            direct_parameter_binding,
+        )
 
     @property
     def forbid_copy_engine_usage(self):
         return self.mode == "cpu"
 
 
-def _hook_module_forward_for_offloader(index, module, offloaders, prefetch_step):
-    def _on_forward_end():
-        offloaders[(index + prefetch_step) % len(offloaders)].start_onload()
-        offloaders[index].offload()
+def _build_slot_prefetch_schedule(num_offloaders: int, prefetch_step: int):
+    """Return the next owner of each static-buffer slot.
 
-    _hook_module_forward_raw(
-        module,
-        on_forward_end=_on_forward_end,
-        get_parameter_and_buffer_dicts=lambda: offloaders[
-            index
-        ].wait_and_get_device_tensors(),
-    )
+    Advancing by ``prefetch_step`` and applying modulo ``num_offloaders`` is
+    unsafe when those values are not divisible: it can overwrite a slot still
+    needed by a later module in the current forward. Build one circular owner
+    chain per slot instead.
+    """
+    if num_offloaders == 0:
+        return []
+    slot_count = min(prefetch_step, num_offloaders)
+    slot_owners = [[] for _ in range(slot_count)]
+    for index in range(num_offloaders):
+        slot_owners[index % slot_count].append(index)
+
+    prefetch_after = [None] * num_offloaders
+    for owners in slot_owners:
+        for owner_index, owner in enumerate(owners):
+            prefetch_after[owner] = owners[(owner_index + 1) % len(owners)]
+    return prefetch_after
+
+
+def _hook_module_forward_for_offloader(index, module, offloaders, next_index):
+    original_forward = module.forward
+
+    def forward(*args, **kwargs):
+        module.forward = original_forward
+        current_offloader = offloaders[index]
+        try:
+            if current_offloader.uses_direct_parameter_binding:
+                current_offloader.wait_until_loaded()
+                output = original_forward(*args, **kwargs)
+            else:
+                output = functional_call(
+                    module,
+                    current_offloader.wait_and_get_device_tensors(),
+                    args=args,
+                    kwargs=kwargs,
+                )
+
+            offloaders[next_index].start_onload(
+                allow_paced_chunking=(next_index <= index)
+            )
+            current_offloader.offload()
+            return output
+        finally:
+            module.forward = forward
+
+    module.forward = forward
 
 
 def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_dicts):
@@ -281,18 +389,30 @@ class _ModuleOffloader(ABC):
         module: torch.nn.Module,
         alt_stream: torch.cuda.Stream,
         whitelist_param_names: List[str],
+        module_index: int,
+        tail_copy_scheduler: Optional[TailCopyScheduler],
     ):
         self.mode = mode
         self.module = module
         self.device = next(module.parameters()).device
         self.alt_stream = alt_stream
+        self.module_index = module_index
+        self.tail_copy_scheduler = tail_copy_scheduler
 
         assert self.device != torch.device("cpu"), (
             "not handled device=cpu case yet (should skip this tensor)"
         )
 
         self._device_tensors = None
+        self._static_device_tensors = None
+        self._cpu_slab = None
+        self._static_device_slab = None
+        self._slab_layout = None
+        self._uses_direct_parameter_binding = False
         self._load_event = None
+        self._load_event_recorded = threading.Event()
+        self._load_event_recorded.set()
+        self._copy_thread_error = None
 
         param_dict = dict(self.module.named_parameters())
         assert all(name in param_dict for name in whitelist_param_names), (
@@ -307,35 +427,230 @@ class _ModuleOffloader(ABC):
     def post_init(self):
         for name, param_offloader in self._param_offloaders.items():
             param_offloader.post_init()
+        if self.mode == "cpu" and envs.SGLANG_OFFLOAD_CONTIGUOUS_SLAB.get():
+            self._build_contiguous_cpu_slab()
 
-    def start_onload(self):
+    @staticmethod
+    def _align_up(value: int, alignment: int) -> int:
+        return (value + alignment - 1) // alignment * alignment
+
+    @staticmethod
+    def _view_slab_tensor(
+        slab: torch.Tensor,
+        offset_bytes: int,
+        source: torch.Tensor,
+    ) -> torch.Tensor:
+        storage_bytes = _strided_storage_size_bytes(source)
+        byte_view = slab.narrow(0, offset_bytes, storage_bytes)
+        typed_storage = byte_view.view(source.dtype)
+        return typed_storage.as_strided(source.shape, source.stride())
+
+    def _build_contiguous_cpu_slab(self):
+        sources = {
+            name: offloader.get_offload_source()
+            for name, offloader in self._param_offloaders.items()
+        }
+        unsupported = [
+            name
+            for name, tensor in sources.items()
+            if any(stride < 0 for stride in tensor.stride())
+        ]
+        if unsupported:
+            logger.warning(
+                "[offloader] contiguous slab disabled for %s: negative-stride params=%s",
+                type(self.module).__name__,
+                unsupported,
+            )
+            return
+
+        layout = {}
+        offset = 0
+        for name, source in sources.items():
+            offset = self._align_up(
+                offset,
+                max(_OFFLOAD_SLAB_ALIGNMENT_BYTES, source.element_size()),
+            )
+            layout[name] = offset
+            offset += _strided_storage_size_bytes(source)
+        total_bytes = self._align_up(offset, _OFFLOAD_SLAB_ALIGNMENT_BYTES)
+        cpu_slab = torch.empty(
+            total_bytes,
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=is_pin_memory_available(),
+        )
+        for name, source in sources.items():
+            view = self._view_slab_tensor(cpu_slab, layout[name], source)
+            view.copy_(source)
+            self._param_offloaders[name].assign_cpu_storage(view)
+
+        self._cpu_slab = cpu_slab
+        self._slab_layout = layout
+        logger.info(
+            "[offloader] packed contiguous CPU slab: module=%s params=%s bytes=%s pinned=%s",
+            type(self.module).__name__,
+            list(layout),
+            total_bytes,
+            cpu_slab.is_pinned(),
+        )
+
+    def start_onload(self, allow_paced_chunking: bool = False):
+        self._load_event_recorded.wait()
+        if self._copy_thread_error is not None:
+            raise RuntimeError(
+                "Paced offload H2D copy failed"
+            ) from self._copy_thread_error
         if torch.cuda.is_current_stream_capturing():
             self._device_tensors = self._create_device_tensors()
             self._load_event = None
             return
+
+        use_paced_copy = (
+            allow_paced_chunking
+            and self.tail_copy_scheduler is not None
+            and self._static_device_tensors is not None
+        )
+        if use_paced_copy:
+            self._start_paced_onload()
+            return
+
         self.alt_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.alt_stream):
             self._device_tensors = self._create_device_tensors()
             self._load_event = torch.cuda.Event()
             self._load_event.record()
+        self._load_event_recorded.set()
+
+    def _start_paced_onload(self):
+        fork_event = torch.cuda.Event()
+        fork_event.record(torch.cuda.current_stream())
+        self._device_tensors = self._static_device_tensors
+        self._load_event = torch.cuda.Event()
+        self._copy_thread_error = None
+        self._load_event_recorded.clear()
+
+        chunk_bytes = envs.SGLANG_OFFLOAD_TAIL_COPY_CHUNK_MB.get() * 1024**2
+        copy_items = []
+        if self._static_device_slab is not None:
+            copy_items.extend(
+                iter_chunked_tensor_views(
+                    self._static_device_slab,
+                    self._cpu_slab,
+                    self._cpu_slab.numel() * self._cpu_slab.element_size(),
+                    chunk_bytes,
+                )
+            )
+        else:
+            for name, param_offloader in self._param_offloaders.items():
+                source = param_offloader.get_offload_source()
+                destination = self._static_device_tensors[name]
+                copy_items.extend(
+                    iter_chunked_tensor_views(
+                        destination,
+                        source,
+                        source.numel() * source.element_size(),
+                        chunk_bytes,
+                    )
+                )
+
+        self.tail_copy_scheduler.submit(
+            TailCopyJob(
+                owner=self,
+                target_index=self.module_index,
+                fork_event=fork_event,
+                copy_items=tuple(copy_items),
+            )
+        )
 
     def offload(self):
-        self._device_tensors = None
+        if self._static_device_tensors is None:
+            self._device_tensors = None
         self._load_event = None
 
     def wait_and_get_device_tensors(self):
+        self.wait_until_loaded()
+        return self._device_tensors
+
+    def wait_until_loaded(self):
         assert self._device_tensors is not None
+        self._load_event_recorded.wait()
+        if self._copy_thread_error is not None:
+            raise RuntimeError(
+                "Paced offload H2D copy failed"
+            ) from self._copy_thread_error
         if torch.cuda.is_current_stream_capturing():
             if self._load_event is not None:
                 self._device_tensors = self._create_device_tensors()
                 self._load_event = None
-            return self._device_tensors
+            return
         if self._load_event is not None:
             self._load_event.wait()
-        return self._device_tensors
 
     def _create_device_tensors(self):
+        if self._static_device_tensors is not None:
+            if self._static_device_slab is not None:
+                self._static_device_slab.copy_(self._cpu_slab, non_blocking=True)
+            else:
+                for name, param_offloader in self._param_offloaders.items():
+                    self._static_device_tensors[name].copy_(
+                        param_offloader.get_offload_source(), non_blocking=True
+                    )
+            return self._static_device_tensors
         return {k: v.create_device_tensor() for k, v in self._param_offloaders.items()}
+
+    def parameter_signature(self):
+        return (
+            self._cpu_slab is not None,
+            tuple(
+                (
+                    name,
+                    tuple(param_offloader.get_offload_source().shape),
+                    tuple(param_offloader.get_offload_source().stride()),
+                    param_offloader.get_offload_source().dtype,
+                )
+                for name, param_offloader in self._param_offloaders.items()
+            )
+        )
+
+    def allocate_static_device_tensors(self):
+        if self._cpu_slab is not None:
+            device_slab = torch.empty_like(self._cpu_slab, device=self.device)
+            device_tensors = {
+                name: self._view_slab_tensor(
+                    device_slab,
+                    self._slab_layout[name],
+                    param_offloader.get_offload_source(),
+                )
+                for name, param_offloader in self._param_offloaders.items()
+            }
+            return device_tensors, device_slab
+        device_tensors = {
+            name: torch.empty_strided(
+                size=param_offloader.get_offload_source().size(),
+                stride=param_offloader.get_offload_source().stride(),
+                dtype=param_offloader.get_offload_source().dtype,
+                device=self.device,
+            )
+            for name, param_offloader in self._param_offloaders.items()
+        }
+        return device_tensors, None
+
+    def assign_static_device_tensors(
+        self,
+        device_tensors,
+        device_slab=None,
+        direct_parameter_binding: bool = False,
+    ):
+        self._static_device_tensors = device_tensors
+        self._static_device_slab = device_slab
+        self._uses_direct_parameter_binding = direct_parameter_binding
+        if direct_parameter_binding:
+            for name, param_offloader in self._param_offloaders.items():
+                param_offloader.assign_static_device_tensor(device_tensors[name])
+
+    @property
+    def uses_direct_parameter_binding(self):
+        return self._uses_direct_parameter_binding
 
 
 class _BaseParamOffloader(ABC):
@@ -362,6 +677,12 @@ class _BaseParamOffloader(ABC):
     def create_device_tensor(self):
         raise NotImplementedError
 
+    def get_offload_source(self):
+        return self._param
+
+    def assign_static_device_tensor(self, device_tensor):
+        raise NotImplementedError
+
 
 class _MetaParamOffloader(_BaseParamOffloader):
     """Usually used for debugging."""
@@ -378,9 +699,34 @@ class _CpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
         _move_param_to_cpu(self._param, pin_memory=True)
+        self._cpu_storage = None
+
+    def post_init(self):
+        if self._param.device.type != "cpu":
+            raise RuntimeError(
+                f"Expected offloaded parameter {self._param_name} on CPU before "
+                f"static buffer assignment, got {self._param.device}"
+            )
+        if is_pin_memory_available() and not self._param.is_pinned():
+            _move_param_to_cpu(self._param, pin_memory=True)
+        self._cpu_storage = self._param.data
 
     def create_device_tensor(self):
-        return self._param.to("cuda", non_blocking=True)
+        return self.get_offload_source().to("cuda", non_blocking=True)
+
+    def get_offload_source(self):
+        return self._cpu_storage if self._cpu_storage is not None else self._param
+
+    def assign_cpu_storage(self, cpu_storage):
+        if cpu_storage.device.type != "cpu":
+            raise ValueError("Offload slab views must be CPU tensors")
+        self._cpu_storage = cpu_storage
+        self._param.data = cpu_storage
+
+    def assign_static_device_tensor(self, device_tensor):
+        if self._cpu_storage is None:
+            self.post_init()
+        self._param.data = device_tensor
 
 
 class _ShmCpuParamOffloader(_BaseParamOffloader):
@@ -482,6 +828,19 @@ def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
         device=device,
         pin_memory=pin_memory,
     )
+
+
+def _strided_storage_size_bytes(tensor: torch.Tensor) -> int:
+    """Return the storage span needed for a positive-stride tensor view."""
+    if tensor.numel() == 0:
+        return 0
+    if tensor.ndim == 0:
+        return tensor.element_size()
+    storage_elements = 1 + sum(
+        (size - 1) * stride
+        for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    return storage_elements * tensor.element_size()
 
 
 # ----------------------------------------- ShardedGpu ------------------------------------------------------
