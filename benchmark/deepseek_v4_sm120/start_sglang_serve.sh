@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MODEL_PATH="${MODEL_PATH:-/models/DeepSeek-V4-Pro}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-DeepSeek-V4-Pro}"
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8000}"
+
+TP_SIZE="${TP_SIZE:-8}"
+DP_SIZE="${DP_SIZE:-2}"
+EP_SIZE="${EP_SIZE:-8}"
+ATTN_CP_SIZE="${ATTN_CP_SIZE:-4}"
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-92288}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-81920}"
+MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-40960}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-14}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.722}"
+OFFLOAD_GROUP_SIZE="${OFFLOAD_GROUP_SIZE:-16}"
+OFFLOAD_NUM_IN_GROUP="${OFFLOAD_NUM_IN_GROUP:-14}"
+OFFLOAD_PREFETCH_STEP="${OFFLOAD_PREFETCH_STEP:-3}"
+
+export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,4,1,5,2,6,3,7}"
+export LD_LIBRARY_PATH="/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
+
+export SGLANG_RUST_BUILD_MODE="${SGLANG_RUST_BUILD_MODE:-never}"
+export SGLANG_NUMA_BIND_V2="${SGLANG_NUMA_BIND_V2:-True}"
+export SGLANG_AUTO_NUMA_BIND="${SGLANG_AUTO_NUMA_BIND:-True}"
+export SGLANG_ENABLE_JIT_DEEPGEMM="${SGLANG_ENABLE_JIT_DEEPGEMM:-True}"
+export SGLANG_DEEPGEMM_PDL="${SGLANG_DEEPGEMM_PDL:-True}"
+
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-1024}"
+export SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-10240}"
+export SGLANG_DEEPEP_V2_NUM_SMS="${SGLANG_DEEPEP_V2_NUM_SMS:-64}"
+export SGLANG_DEEPEP_V2_COMBINE_NUM_SMS="${SGLANG_DEEPEP_V2_COMBINE_NUM_SMS:-16}"
+export SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS="${SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS:-32}"
+export SGLANG_DEEPEP_V2_PREFILL_DO_EXPAND="${SGLANG_DEEPEP_V2_PREFILL_DO_EXPAND:-1}"
+export SGLANG_DEEPEP_V2_MXFP8_DISPATCH="${SGLANG_DEEPEP_V2_MXFP8_DISPATCH:-1}"
+export SGLANG_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION="${SGLANG_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION:-1}"
+export SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS="${SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS:-0}"
+
+export SGLANG_DSV4_CP_KV_COMM_DTYPE="${SGLANG_DSV4_CP_KV_COMM_DTYPE:-fp8}"
+export SGLANG_DSV4_CP_COMPRESSOR_COMM_DTYPE="${SGLANG_DSV4_CP_COMPRESSOR_COMM_DTYPE:-fp8}"
+export SGLANG_OFFLOAD_STATIC_BUFFER_RING="${SGLANG_OFFLOAD_STATIC_BUFFER_RING:-0}"
+export SGLANG_OFFLOAD_DIRECT_STATIC_PREFETCH="${SGLANG_OFFLOAD_DIRECT_STATIC_PREFETCH:-1}"
+export SGLANG_OFFLOAD_EARLY_PREFETCH="${SGLANG_OFFLOAD_EARLY_PREFETCH:-0}"
+export SGLANG_OFFLOAD_CONTIGUOUS_SLAB="${SGLANG_OFFLOAD_CONTIGUOUS_SLAB:-0}"
+export SGLANG_OFFLOAD_PACED_TAIL_COPY="${SGLANG_OFFLOAD_PACED_TAIL_COPY:-1}"
+export SGLANG_OFFLOAD_TAIL_COPY_CHUNK_MB="${SGLANG_OFFLOAD_TAIL_COPY_CHUNK_MB:-128}"
+export SGLANG_OPT_DG_MASKED_M_CAP="${SGLANG_OPT_DG_MASKED_M_CAP:-1}"
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="${SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK:-10240}"
+export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH="${SGLANG_FP8_PAGED_MQA_LOGITS_TORCH:-1}"
+export SGLANG_OPT_USE_TILELANG_INDEXER="${SGLANG_OPT_USE_TILELANG_INDEXER:-1}"
+
+export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-1}"
+export NCCL_GIN_ENABLE="${NCCL_GIN_ENABLE:-1}"
+export EP_DISABLE_GIN="${EP_DISABLE_GIN:-0}"
+
+# Site-specific NIC/GID/QoS variables are intentionally not defaulted here.
+# Configure NCCL_IB_HCA, NCCL_IB_GID_INDEX, and NCCL_GIN_IB_TC on the host.
+
+args=(
+  --model-path "${MODEL_PATH}"
+  --served-model-name "${SERVED_MODEL_NAME}"
+  --host "${HOST}"
+  --port "${PORT}"
+  --trust-remote-code
+  --tp-size "${TP_SIZE}"
+  --dp-size "${DP_SIZE}"
+  --ep-size "${EP_SIZE}"
+  --enable-dp-attention
+  --attn-cp-size "${ATTN_CP_SIZE}"
+  --moe-dense-tp-size 1
+  --moe-runner-backend deep_gemm
+  --moe-a2a-backend deepep_v2
+  --deepep-mode normal
+  --deepep-v2-mode direct
+  --context-length "${CONTEXT_LENGTH}"
+  --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}"
+  --max-prefill-tokens "${MAX_PREFILL_TOKENS}"
+  --max-running-requests "${MAX_RUNNING_REQUESTS}"
+  --mem-fraction-static "${MEM_FRACTION_STATIC}"
+  --kv-cache-dtype fp8_e4m3
+  --offload-group-size "${OFFLOAD_GROUP_SIZE}"
+  --offload-num-in-group "${OFFLOAD_NUM_IN_GROUP}"
+  --offload-prefetch-step "${OFFLOAD_PREFETCH_STEP}"
+  --offload-mode cpu
+  --watchdog-timeout 12000
+  --disable-cuda-graph
+  --disable-shared-experts-fusion
+  --enable-prefill-cp
+  --cp-strategy interleave
+  --enable-single-batch-overlap
+  --disable-overlap-schedule
+  --swa-full-tokens-ratio 0.2
+)
+
+if [[ -n "${EXTRA_SGLANG_ARGS:-}" ]]; then
+  # EXTRA_SGLANG_ARGS is intended for simple whitespace-separated A/B flags.
+  # shellcheck disable=SC2206
+  extra_args=(${EXTRA_SGLANG_ARGS})
+  args+=("${extra_args[@]}")
+fi
+
+printf 'Starting SGLang with args:'
+printf ' %q' "${args[@]}"
+printf '\n'
+exec python3 -m sglang.launch_server "${args[@]}"
