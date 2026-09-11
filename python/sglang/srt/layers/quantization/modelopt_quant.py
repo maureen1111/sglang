@@ -2327,7 +2327,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
         # swizzle+allocate here to avoid GPU memory fragmentation
-        if self.enable_flashinfer_trtllm_moe:
+        if self.enable_flashinfer_trtllm_moe or get_moe_runner_backend().is_deep_gemm():
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2347,7 +2347,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if self.enable_flashinfer_trtllm_moe:
+        if self.enable_flashinfer_trtllm_moe or get_moe_runner_backend().is_deep_gemm():
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
@@ -2494,6 +2494,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             if MOE_NVFP4_DISPATCH:
                 assert torch.all(w13_input_scale == w13_input_scale[0])
                 w13_input_scale = w13_input_scale[0]
+        elif moe_runner_backend.is_deep_gemm():
+            # DeepGEMM runs on local EP weights, so keep per-expert scales but
+            # slice the checkpoint's global-expert activation-scale vectors.
+            begin = layer.moe_ep_rank * layer.num_local_experts
+            end = begin + layer.num_local_experts
+            w13_input_scale = (
+                layer.w13_input_scale.max(dim=-1).values.to(torch.float32)[begin:end]
+            )
+            w2_input_scale = layer.w2_input_scale.to(torch.float32)[begin:end]
+            if not torch.all(w2_input_scale == w2_input_scale[0]):
+                raise ValueError(
+                    "NVFP4 compact activation quantization requires identical "
+                    "routed-expert A2 scales"
+                )
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
@@ -2567,13 +2581,30 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = not self.quant_config.use_per_token_activation and (
-            MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
+            MOE_NVFP4_DISPATCH
+            or moe_runner_backend.is_deep_gemm()
+            or should_use_flashinfer_cutlass_moe_fp4_allgather()
         )
+
+        # Dispatch quantization happens before routing, so FlashInfer accepts
+        # one activation scale for the whole token matrix (or one per token),
+        # not one value per local expert.  GLM-5.2-NVFP4 stores the same A1
+        # scale for every routed expert; retain the per-expert vector for the
+        # exact GEMM outer-alpha calculation above, but pass its scalar value
+        # to the wire-format quantizer.
+        dispatch_input_scale = layer.w13_input_scale_quant
+        if moe_runner_backend.is_deep_gemm() and use_dispatch_fp4:
+            if not torch.all(dispatch_input_scale == dispatch_input_scale[0]):
+                raise ValueError(
+                    "NVFP4 pre-routing quantization requires identical routed "
+                    "expert input scales"
+                )
+            dispatch_input_scale = dispatch_input_scale[0]
 
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
-                    layer.w13_input_scale_quant if use_dispatch_fp4 else None
+                    dispatch_input_scale if use_dispatch_fp4 else None
                 )
             }
         )
@@ -2606,6 +2637,32 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
 
         # Weight processing based on strategy
+        if moe_runner_backend.is_deep_gemm():
+            from deep_gemm.utils import transform_ue4m3_sf_into_required_layout
+
+            # ModelOpt stores two E2M1 values in every uint8 and one UE4M3
+            # block scale per 16 K elements.  DeepGEMM consumes the same bits
+            # as int8 plus an int32-packed, MN-major scale layout.  Outer
+            # scales remain FP32 and are applied by the runner.
+            w13_weight = layer.w13_weight.data.view(torch.int8)
+            w2_weight = layer.w2_weight.data.view(torch.int8)
+            w13_scale = transform_ue4m3_sf_into_required_layout(
+                layer.w13_weight_scale.data,
+                layer.w13_weight.shape[1],
+            )
+            w2_scale = transform_ue4m3_sf_into_required_layout(
+                layer.w2_weight_scale.data,
+                layer.w2_weight.shape[1],
+            )
+            copy_or_rebind_param(layer, "w13_weight", w13_weight)
+            copy_or_rebind_param(layer, "w2_weight", w2_weight)
+            copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
+            copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
+            layer.w13_blockscale_swizzled = layer.w13_weight_scale
+            layer.w2_blockscale_swizzled = layer.w2_weight_scale
+            layer._nvfp4_deep_gemm = True
+            return
+
         if (
             self.enable_flashinfer_trtllm_moe
             and reorder_rows_for_gated_act_gemm is not None
@@ -2777,6 +2834,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
+        if moe_runner_backend.is_deep_gemm():
+            import sglang.srt.layers.moe.moe_runner.deep_gemm  # noqa: F401
+
         if moe_runner_backend.is_cutlass():
             raise NotImplementedError(
                 "moe_runner_backend=cutlass is not supported for NVFP4 MoE. "
@@ -2873,6 +2933,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,
             )
 
+            return self.runner.run(dispatch_output, quant_info)
+
+        if moe_runner_backend.is_deep_gemm():
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                DeepGemmMoeQuantInfo,
+            )
+
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=[1, 16],
+                is_nvfp4_experts=True,
+                g1_alphas=layer.g1_alphas,
+                g1_alphas_up=layer.g1_alphas_up,
+                g2_alphas=layer.g2_alphas,
+                a2_global_scale=layer.w2_input_scale_quant,
+            )
             return self.runner.run(dispatch_output, quant_info)
 
         if self.enable_flashinfer_cutedsl_moe:

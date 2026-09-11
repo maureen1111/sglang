@@ -288,6 +288,23 @@ def fused_experts_flashinfer_to_flashinfer_cutlass(
         not runner_config.apply_router_weight_on_input
     ), "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
 
+    # FlashInfer WideEP intentionally falls back to the Standard dispatcher
+    # for extend/prefill (AG before MoE, RS after MoE).  The fused-function
+    # registry still selects this FlashInfer entry, so handle that valid
+    # StandardDispatchOutput instead of assuming the decode-only moe_output
+    # workspace field exists.
+    if dispatch_output.format.is_standard():
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardCombineInput,
+        )
+
+        output = _run_flashinfer_cutlass(
+            dispatch_output=dispatch_output,
+            quant_info=quant_info,
+            runner_config=runner_config,
+        )
+        return StandardCombineInput(hidden_states=output)
+
     output = _run_flashinfer_cutlass(
         dispatch_output=dispatch_output,
         quant_info=quant_info,

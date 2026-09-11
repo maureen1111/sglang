@@ -13,6 +13,7 @@ separate region at the end of each page.
 
 import logging
 import math
+import os
 from typing import Optional
 
 import torch
@@ -24,6 +25,7 @@ from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+_USE_POW2_KV_SCALE = os.getenv("SGLANG_DSA_POW2_KV", "0") == "1"
 
 _GLM_DSA_MODEL_ARCHS = (
     "GlmMoeDsaForCausalLM",
@@ -638,7 +640,9 @@ def flashinfer_sparse_mla_forward(
         sparse_mla_top_k=topk,
         bmm1_scale=float(sm_scale),
         bmm2_scale=1.0,
-        kv_scale_format="arbitrary_fp32",
+        # Must match quant_k_cache.py.  pow2_fp32 selects FlashInfer's
+        # single-MMA path; arbitrary_fp32 preserves the stock exact baseline.
+        kv_scale_format=("pow2_fp32" if _USE_POW2_KV_SCALE else "arbitrary_fp32"),
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
     )
     return result.squeeze(1)

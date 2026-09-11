@@ -247,8 +247,11 @@ class FlashinferDispatcher(BaseDispatcher):
     def _dispatch_prefill_allgather(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
-        # Eager extend can overlap another stream, so use BF16 all-gatherv instead
-        # of reusing pure-decode A2A signal state across streams.
+        # Eager extend can overlap another stream, so use all-gatherv instead of
+        # reusing pure-decode A2A signal state across streams.  For NVFP4 MoE,
+        # quantize before the collective: the stock WideEP fallback all-gathers
+        # BF16 and only quantizes after communication, which sends roughly 4x
+        # more activation bytes over PCIe than the packed FP4 payload.
 
         if hidden_states.dtype != torch.bfloat16:
             raise TypeError(
@@ -283,14 +286,60 @@ class FlashinferDispatcher(BaseDispatcher):
             )
 
         topk_ids = topk_output.topk_ids.to(torch.int32)
-        hidden_states, topk_ids, topk_weights = get_parallel().tp_group.all_gatherv(
-            [hidden_states, topk_ids, topk_output.topk_weights],
-            sizes=source_sizes,
-        )
+        topk_weights = topk_output.topk_weights
+        global_scale = self.quant_config.get("input_global_scale", None)
+        hidden_states_scale = None
+        if global_scale is not None:
+            if hidden_states.shape[0] > 0:
+                hidden_states, hidden_states_scale = fp4_quantize(
+                    hidden_states,
+                    global_scale,
+                    is_sf_swizzled_layout=False,
+                )
+            else:
+                hidden_size = hidden_states.shape[1]
+                hidden_states = torch.zeros(
+                    0,
+                    hidden_size // 2,
+                    dtype=torch.uint8,
+                    device=hidden_states.device,
+                )
+                hidden_states_scale = torch.zeros(
+                    0,
+                    hidden_size // 16,
+                    dtype=torch.uint8,
+                    device=hidden_states.device,
+                )
+
+            (
+                hidden_states,
+                hidden_states_scale,
+                topk_ids,
+                topk_weights,
+            ) = get_parallel().tp_group.all_gatherv(
+                [hidden_states, hidden_states_scale, topk_ids, topk_weights],
+                sizes=source_sizes,
+            )
+            # Keep raw row-major UE4M3 bytes for DeepGEMM's fused scatter;
+            # only the FlashInfer CUTLASS runner consumes this swizzle.
+            if get_moe_runner_backend().is_flashinfer_cutlass():
+                hidden_states_scale = nvfp4_block_scale_interleave(hidden_states_scale)
+        else:
+            hidden_states, topk_ids, topk_weights = (
+                get_parallel().tp_group.all_gatherv(
+                    [hidden_states, topk_ids, topk_weights],
+                    sizes=source_sizes,
+                )
+            )
         self.prefill_source_sizes = source_sizes
-        return self.prefill_dispatcher.dispatch(
-            hidden_states,
-            StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits),
+        return StandardDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            topk_output=StandardTopKOutput(
+                topk_weights,
+                topk_ids,
+                topk_output.router_logits,
+            ),
         )
 
     @debug_kernel_api
@@ -457,9 +506,23 @@ class FlashinferDispatcher(BaseDispatcher):
                     f"got {hidden_states.dtype}."
                 )
             source_sizes = self.prefill_source_sizes
-            hidden_states = get_parallel().tp_group.reduce_scatterv(
-                hidden_states, sizes=source_sizes
-            )
+            overlap_args = self.overlap_args
+            if overlap_args is None:
+                hidden_states = get_parallel().tp_group.reduce_scatterv(
+                    hidden_states, sizes=source_sizes
+                )
+            else:
+                # The routed down projection records wait_event on the main
+                # stream.  Launch WideEP reduce-scatter on the alternate
+                # stream so the main stream can execute the shared expert.
+                current_stream = torch.cuda.current_stream()
+                overlap_args.stream.wait_event(overlap_args.wait_event)
+                with torch.cuda.stream(overlap_args.stream):
+                    hidden_states = get_parallel().tp_group.reduce_scatterv(
+                        hidden_states, sizes=source_sizes
+                    )
+                current_stream.wait_stream(overlap_args.stream)
+                hidden_states.record_stream(current_stream)
             del self.prefill_source_sizes
             return hidden_states
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -30,6 +31,9 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    _current_capture_var as _bcg_current_capture_var,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -84,6 +88,39 @@ else:
 
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
+_nvfp4_compact_logged_shapes: set[tuple[int, int, int, int]] = set()
+_nvfp4_static_rows_by_layer_cache: Optional[dict[int, int]] = None
+_nvfp4_capture_rows_by_layer: dict[int, int] = {}
+
+
+def _get_nvfp4_static_rows_by_layer() -> dict[int, int]:
+    """Parse graph-safe, per-layer contiguous capacities once per worker."""
+    global _nvfp4_static_rows_by_layer_cache
+    if _nvfp4_static_rows_by_layer_cache is not None:
+        return _nvfp4_static_rows_by_layer_cache
+
+    raw = os.getenv("SGLANG_NVFP4_DG_STATIC_ROWS_BY_LAYER", "").strip()
+    capacities: dict[int, int] = {}
+    if raw:
+        for item in raw.split(","):
+            try:
+                layer_text, rows_text = item.split(":", 1)
+                layer_id, rows = int(layer_text), int(rows_text)
+            except ValueError as exc:
+                raise ValueError(
+                    "SGLANG_NVFP4_DG_STATIC_ROWS_BY_LAYER must contain "
+                    "comma-separated layer:rows entries"
+                ) from exc
+            if layer_id in capacities:
+                raise ValueError(f"duplicate NVFP4 static capacity for layer {layer_id}")
+            if rows < 128 or rows % 128:
+                raise ValueError(
+                    f"NVFP4 static rows for layer {layer_id} must be a positive "
+                    f"multiple of 128, got {rows}"
+                )
+            capacities[layer_id] = rows
+    _nvfp4_static_rows_by_layer_cache = capacities
+    return capacities
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -251,6 +288,14 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
+    # ModelOpt NVFP4 W4A4 on SM120.  Activations and weights use one UE4M3
+    # scale per 16 K values; the small outer scales stay FP32 and are applied
+    # explicitly so they cannot underflow when folded into E4M3 block scales.
+    is_nvfp4_experts: bool = False
+    g1_alphas: Optional[torch.Tensor] = None
+    g1_alphas_up: Optional[torch.Tensor] = None
+    g2_alphas: Optional[torch.Tensor] = None
+    a2_global_scale: Optional[torch.Tensor] = None
     use_mxfp8: bool = False
 
     def __post_init__(self):
@@ -262,6 +307,193 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
             assert (
                 deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             ), "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
+
+
+@triton.jit
+def _nvfp4_scatter_scale_mn_major_kernel(
+    scale_ptr,
+    packed_scale_ptr,
+    src2dst_ptr,
+    topk,
+    scale_row_stride,
+    scale_col_stride,
+    scale_groups4,
+    m_max,
+    BLOCK_GROUPS4: tl.constexpr,
+):
+    """Scatter UE4M3 bytes directly into DeepGEMM's packed MN-major layout."""
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    src_scale = scale_ptr + src_idx * scale_row_stride
+    groups4 = tl.arange(0, BLOCK_GROUPS4)
+    mask = groups4 < scale_groups4
+    byte_base = groups4 * 4
+    b0 = tl.load(
+        src_scale + (byte_base + 0) * scale_col_stride, mask=mask, other=0.0
+    ).to(tl.uint8, bitcast=True)
+    b1 = tl.load(
+        src_scale + (byte_base + 1) * scale_col_stride, mask=mask, other=0.0
+    ).to(tl.uint8, bitcast=True)
+    b2 = tl.load(
+        src_scale + (byte_base + 2) * scale_col_stride, mask=mask, other=0.0
+    ).to(tl.uint8, bitcast=True)
+    b3 = tl.load(
+        src_scale + (byte_base + 3) * scale_col_stride, mask=mask, other=0.0
+    ).to(tl.uint8, bitcast=True)
+    packed = (
+        b0.to(tl.int32)
+        | (b1.to(tl.int32) << 8)
+        | (b2.to(tl.int32) << 16)
+        | (b3.to(tl.int32) << 24)
+    )
+    for route in range(topk):
+        dst = tl.load(src2dst_ptr + route).to(tl.int64)
+        if dst >= 0:
+            expert = dst // m_max
+            row = dst % m_max
+            out = (
+                packed_scale_ptr
+                + expert * scale_groups4 * m_max
+                + groups4 * m_max
+                + row
+            )
+            tl.store(out, packed, mask=mask)
+
+
+@triton.jit
+def _nvfp4_scale_gateup_kernel(
+    gateup_ptr,
+    src2dst_ptr,
+    gate_alpha_ptr,
+    up_alpha_ptr,
+    topk,
+    half_n,
+    m_max,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Apply exact ModelOpt GEMM1 outer scales before the gated activation."""
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    offsets = tl.arange(0, BLOCK_SIZE)
+    for route in range(topk):
+        dst = tl.load(src2dst_ptr + route).to(tl.int64)
+        if dst >= 0:
+            expert = dst // m_max
+            gate_alpha = tl.load(gate_alpha_ptr + expert).to(tl.float32)
+            up_alpha = tl.load(up_alpha_ptr + expert).to(tl.float32)
+            row_ptr = gateup_ptr + dst * (2 * half_n)
+            for start in tl.range(0, half_n, BLOCK_SIZE):
+                cols = start + offsets
+                mask = cols < half_n
+                gate = tl.load(row_ptr + cols, mask=mask).to(tl.float32)
+                up = tl.load(row_ptr + half_n + cols, mask=mask).to(tl.float32)
+                tl.store(row_ptr + cols, gate * gate_alpha, mask=mask)
+                tl.store(row_ptr + half_n + cols, up * up_alpha, mask=mask)
+
+
+@triton.jit
+def _nvfp4_post_reorder_alpha_kernel(
+    down_output_ptr,
+    output_ptr,
+    src2dst_ptr,
+    topk_weights_ptr,
+    g2_alpha_ptr,
+    topk: tl.constexpr,
+    num_tokens,
+    hidden_size,
+    m_max,
+    routed_scaling_factor: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Weighted combine with the per-expert GEMM2 outer scale folded in."""
+    src_idx = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = cols < hidden_size
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_weights_ptr = topk_weights_ptr + src_idx * topk
+    total = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for route in range(topk):
+        dst = tl.load(src2dst_ptr + route).to(tl.int64)
+        if dst >= 0:
+            expert = dst // m_max
+            alpha = tl.load(g2_alpha_ptr + expert).to(tl.float32)
+            weight = tl.load(topk_weights_ptr + route).to(tl.float32)
+            value = tl.load(
+                down_output_ptr + dst * hidden_size + cols, mask=mask
+            ).to(tl.float32)
+            total += value * weight * alpha
+    total *= routed_scaling_factor
+    tl.store(
+        output_ptr + src_idx * hidden_size + cols,
+        total.to(output_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+@triton.jit
+def _nvfp4_scale_gateup_contiguous_kernel(
+    gateup_ptr,
+    m_indices_ptr,
+    gate_alpha_ptr,
+    up_alpha_ptr,
+    half_n,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Apply exact per-expert GEMM1 scales to compact grouped rows."""
+    row = tl.program_id(0)
+    expert = tl.load(m_indices_ptr + row)
+    if expert >= 0:
+        gate_alpha = tl.load(gate_alpha_ptr + expert).to(tl.float32)
+        up_alpha = tl.load(up_alpha_ptr + expert).to(tl.float32)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        row_ptr = gateup_ptr + row * (2 * half_n)
+        for start in tl.range(0, half_n, BLOCK_SIZE):
+            cols = start + offsets
+            mask = cols < half_n
+            gate = tl.load(row_ptr + cols, mask=mask).to(tl.float32)
+            up = tl.load(row_ptr + half_n + cols, mask=mask).to(tl.float32)
+            tl.store(row_ptr + cols, gate * gate_alpha, mask=mask)
+            tl.store(row_ptr + half_n + cols, up * up_alpha, mask=mask)
+
+
+@triton.jit
+def _nvfp4_post_reorder_alpha_contiguous_kernel(
+    down_output_ptr,
+    output_ptr,
+    src2dst_ptr,
+    topk_weights_ptr,
+    m_indices_ptr,
+    g2_alpha_ptr,
+    topk: tl.constexpr,
+    hidden_size,
+    routed_scaling_factor: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Weighted compact-row combine with the GEMM2 scale folded in."""
+    src_idx = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = cols < hidden_size
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_weights_ptr = topk_weights_ptr + src_idx * topk
+    total = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for route in range(topk):
+        dst = tl.load(src2dst_ptr + route).to(tl.int64)
+        if dst >= 0:
+            expert = tl.load(m_indices_ptr + dst)
+            alpha = tl.load(g2_alpha_ptr + expert).to(tl.float32)
+            weight = tl.load(topk_weights_ptr + route).to(tl.float32)
+            value = tl.load(
+                down_output_ptr + dst * hidden_size + cols, mask=mask
+            ).to(tl.float32)
+            total += value * weight * alpha
+    total *= routed_scaling_factor
+    tl.store(
+        output_ptr + src_idx * hidden_size + cols,
+        total.to(output_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -337,6 +569,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             dispose_tensor(hidden_states_scale)
             return torch.empty(
                 (0, K), device=hidden_states_device, dtype=torch.bfloat16
+            )
+
+        if quant_info.is_nvfp4_experts:
+            return self._run_contiguous_nvfp4_gemm(
+                runner_input, quant_info, running_state
             )
 
         recipe_a, recipe_b = (
@@ -521,6 +758,104 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         return down_output
 
+    def _run_contiguous_nvfp4_gemm(
+        self,
+        runner_input: DeepGemmRunnerInput,
+        quant_info: DeepGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        """Run ModelOpt NVFP4 over compact expert-grouped route rows."""
+        from deep_gemm.utils import transform_ue4m3_sf_into_required_layout
+        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
+
+        hidden_states = runner_input.hidden_states
+        hidden_states_scale = runner_input.hidden_states_scale
+        m_indices = runner_input.m_indices
+        all_tokens = running_state["all_tokens"]
+        hidden_states_device = running_state["hidden_states_device"]
+        hidden_size = running_state["hidden_states_shape"][1]
+        gateup_size = quant_info.w13_weight.size(1)
+
+        assert hidden_states.dtype in (torch.int8, torch.uint8)
+        assert hidden_states_scale.dtype == torch.int32
+        assert m_indices is not None
+        assert quant_info.g1_alphas is not None
+        assert quant_info.g1_alphas_up is not None
+        assert quant_info.a2_global_scale is not None
+
+        gateup_output = torch.empty(
+            (all_tokens, gateup_size),
+            device=hidden_states_device,
+            dtype=torch.bfloat16,
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+            (hidden_states, hidden_states_scale),
+            (quant_info.w13_weight, quant_info.w13_scale),
+            gateup_output,
+            m_indices,
+            recipe_a=(1, 16),
+            recipe_b=(1, 16),
+        )
+        dispose_tensor(hidden_states)
+        dispose_tensor(hidden_states_scale)
+
+        _nvfp4_scale_gateup_contiguous_kernel[(all_tokens,)](
+            gateup_output,
+            m_indices,
+            quant_info.g1_alphas,
+            quant_info.g1_alphas_up,
+            gateup_size // 2,
+            BLOCK_SIZE=1024,
+            num_warps=8,
+        )
+
+        # GLM-5.2-NVFP4 has one common A2 scale across routed experts, so the
+        # compact row matrix can be treated as a single quantization group.
+        # This reuses FlashInfer's fused SwiGLU+NVFP4 kernel and avoids writing
+        # a large BF16 activation only to read it back for quantization.
+        a2_scale = quant_info.a2_global_scale
+        compact_masked_m = running_state["nvfp4_compact_masked_m"]
+        down_input, down_input_sf = (
+            silu_and_mul_scaled_nvfp4_experts_quantize(
+                gateup_output.unsqueeze(0),
+                compact_masked_m,
+                a2_scale[:1],
+            )
+        )
+        del gateup_output
+        down_input = down_input.permute(2, 0, 1).view(torch.int8).squeeze(0)
+        k_scales = (gateup_size // 2) // 16
+        padded_k_scales = ceil_div(k_scales, 4) * 4
+        down_input_sf = down_input_sf.permute(5, 2, 4, 0, 1, 3)
+        assert down_input_sf.is_contiguous()
+        down_input_sf = down_input_sf.view(
+            1, all_tokens, padded_k_scales
+        )[0, :, :k_scales]
+        down_input_scale = transform_ue4m3_sf_into_required_layout(
+            down_input_sf, all_tokens
+        )
+        dispose_tensor(down_input_sf)
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            down_output = torch.empty(
+                (all_tokens, hidden_size),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+            (down_input, down_input_scale),
+            (quant_info.w2_weight, quant_info.w2_scale),
+            down_output,
+            m_indices,
+            recipe_a=(1, 16),
+            recipe_b=(1, 16),
+        )
+        dispose_tensor(down_input)
+        dispose_tensor(down_input_scale)
+        return down_output
+
     def _run_bf16_contiguous_gemm(
         self,
         runner_input: DeepGemmRunnerInput,
@@ -645,11 +980,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a = (quant_info.block_shape[0], gran_k_act)
         elif quant_info.is_fp4_experts:
             recipe_a, recipe_b = (1, 128), (1, 32)
+        elif quant_info.is_nvfp4_experts:
+            recipe_a, recipe_b = (1, 16), (1, 16)
         else:
             recipe_a, recipe_b = None, None
 
         # GroupGemm-0
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if quant_info.is_nvfp4_experts:
+            # FlashInfer dispatch preprocessing writes the int32-packed UE4M3
+            # bytes directly in DeepGEMM's MN-major layout.
+            assert hidden_states.dtype in (torch.int8, torch.uint8)
+            assert hidden_states_scale.dtype == torch.int32
+        elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             if hidden_states_scale.dtype != torch.int:
                 b, s_mn, s_k = hidden_states_scale.shape
                 assert (
@@ -688,6 +1030,23 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a=recipe_a,
             recipe_b=recipe_b,
         )
+        if quant_info.is_nvfp4_experts:
+            assert quant_info.g1_alphas is not None
+            assert quant_info.g1_alphas_up is not None
+            topk_ids_rs = running_state.get("topk_ids")
+            src2dst = running_state.get("src2dst")
+            assert topk_ids_rs is not None and src2dst is not None
+            _nvfp4_scale_gateup_kernel[(topk_ids_rs.shape[0],)](
+                gateup_output,
+                src2dst,
+                quant_info.g1_alphas,
+                quant_info.g1_alphas_up,
+                self.config.top_k,
+                n // 2,
+                m,
+                BLOCK_SIZE=1024,
+                num_warps=8,
+            )
         if trace_deepep_v2_masked:
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 masked runner gateup GEMM returned")
@@ -699,7 +1058,35 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             swiglu_limit_arg = self.swiglu_limit
 
         # Act.
-        if self.config.activation == "situ":
+        if quant_info.is_nvfp4_experts:
+            from deep_gemm.utils import transform_ue4m3_sf_into_required_layout
+            from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
+
+            assert quant_info.a2_global_scale is not None
+            down_input, down_input_sf = (
+                silu_and_mul_scaled_nvfp4_experts_quantize(
+                    gateup_output,
+                    masked_m,
+                    quant_info.a2_global_scale,
+                )
+            )
+            # FlashInfer returns FP4 as logical [M,K/2,E] over contiguous
+            # [E,M,K/2] storage.  Its six-dimensional SF view has the same
+            # bytes as [E,padded_M,padded_Ksf]; convert only the scale layout.
+            down_input = down_input.permute(2, 0, 1).view(torch.int8)
+            half_n = n // 2
+            padded_m = ceil_div(m, 128) * 128
+            k_scales = half_n // 16
+            padded_k_scales = ceil_div(k_scales, 4) * 4
+            down_input_sf_raw = down_input_sf.permute(5, 2, 4, 0, 1, 3)
+            assert down_input_sf_raw.is_contiguous()
+            down_input_sf_raw = down_input_sf_raw.view(
+                num_groups, padded_m, padded_k_scales
+            )[:, :m, :k_scales]
+            down_input_scale = transform_ue4m3_sf_into_required_layout(
+                down_input_sf_raw, m
+            )
+        elif self.config.activation == "situ":
             down_input, down_input_scale = _varlen_deep_gemm_situ_mul_quant(
                 gateup_output,
                 masked_m,
@@ -745,7 +1132,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        if (
+        if quant_info.is_nvfp4_experts:
+            assert down_input_scale.dtype == torch.int32
+        elif (
             use_mxfp8
             and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             and down_input_scale.dtype != torch.int32
@@ -877,6 +1266,340 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.DEEP_GEMM
 
 
+def _pre_permute_nvfp4_dispatch_to_deep_gemm(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    topk_output,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+    expert_start: int,
+) -> DeepGemmRunnerInput:
+    """Build a masked W4A4 slab without dequantizing the A2A FP4 payload."""
+    from sglang.kernels.ops.moe.ep_moe_kernels import (
+        fill_gateup_input_triton_kernel,
+        fused_moe_dispatch_index,
+    )
+
+    if hidden_states.dtype not in (torch.uint8, torch.int8):
+        raise TypeError(
+            "ModelOpt NVFP4 DeepGEMM expects packed FP4 dispatch, got "
+            f"{hidden_states.dtype}."
+        )
+    if hidden_states_scale is None:
+        raise ValueError("ModelOpt NVFP4 DeepGEMM requires dispatch block scales")
+    topk_weights, topk_ids, _ = topk_output
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+
+    num_tokens = hidden_states.shape[0]
+    num_local_experts = runner_config.num_local_experts
+    # A single expert can receive every source token. Exact multiples are safe:
+    # the last valid row is num_tokens-1, so no extra 256-row slab is needed.
+    m_max = max(256, ceil_div(num_tokens, 256) * 256)
+    masked_m, src2dst = fused_moe_dispatch_index(
+        topk_ids,
+        num_local_experts,
+        m_max,
+        expert_start=expert_start,
+    )
+
+    packed_hidden = hidden_states.shape[1]
+    fp4_slab_storage = torch.empty(
+        (num_local_experts, m_max, packed_hidden),
+        device=hidden_states.device,
+        dtype=torch.uint8,
+    )
+    fill_gateup_input_triton_kernel[(num_tokens,)](
+        hidden_states,
+        None,
+        fp4_slab_storage,
+        None,
+        src2dst,
+        topk_ids,
+        runner_config.top_k,
+        packed_hidden,
+        0,
+        m_max,
+        0,
+        0,
+        BLOCK_SIZE=1024,
+        IS_FP8=False,
+        SCALE_MN_MAJOR=False,
+    )
+
+    raw_scale = hidden_states_scale.view(num_tokens, -1)
+    if raw_scale.shape[1] % 4:
+        raise ValueError(
+            f"NVFP4 dispatch scale width must be divisible by 4, got {raw_scale.shape}"
+        )
+    scale_groups4 = raw_scale.shape[1] // 4
+    packed_scale_storage = torch.empty(
+        (num_local_experts, scale_groups4, m_max),
+        device=hidden_states.device,
+        dtype=torch.int32,
+    )
+    _nvfp4_scatter_scale_mn_major_kernel[(num_tokens,)](
+        raw_scale,
+        packed_scale_storage,
+        src2dst,
+        runner_config.top_k,
+        raw_scale.stride(0),
+        raw_scale.stride(1),
+        scale_groups4,
+        m_max,
+        BLOCK_GROUPS4=triton.next_power_of_2(scale_groups4),
+        num_warps=4,
+    )
+    fp4_slab_scale = packed_scale_storage.transpose(-1, -2)
+
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+    running_state["hidden_states_shape"] = (num_tokens, packed_hidden * 2)
+    running_state["hidden_states_dtype"] = torch.bfloat16
+    running_state["hidden_states_device"] = hidden_states.device
+    running_state["src2dst"] = src2dst
+    running_state["nvfp4_m_max"] = m_max
+
+    expected_m = max(
+        1,
+        ceil_div(num_tokens * runner_config.top_k, runner_config.num_experts),
+    )
+    return DeepGemmRunnerInput(
+        hidden_states=fp4_slab_storage.view(torch.int8),
+        hidden_states_scale=fp4_slab_scale,
+        use_masked_gemm=True,
+        masked_m=masked_m,
+        expected_m=expected_m,
+    )
+
+
+def _pre_permute_nvfp4_dispatch_to_deep_gemm_contiguous(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    topk_output,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+    expert_start: int,
+) -> DeepGemmRunnerInput:
+    """Compact packed-FP4 routes instead of allocating an E x max_m slab."""
+    from deep_gemm.utils import transform_ue4m3_sf_into_required_layout
+    from sglang.kernels.ops.moe.ep_moe_kernels import (
+        ep_scatter,
+        fused_moe_dispatch_index,
+    )
+
+    if hidden_states.dtype not in (torch.uint8, torch.int8):
+        raise TypeError(
+            "ModelOpt NVFP4 DeepGEMM expects packed FP4 dispatch, got "
+            f"{hidden_states.dtype}."
+        )
+    if hidden_states_scale is None:
+        raise ValueError("ModelOpt NVFP4 DeepGEMM requires dispatch block scales")
+    topk_weights, topk_ids, _ = topk_output
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+
+    num_tokens = hidden_states.shape[0]
+    num_local_experts = runner_config.num_local_experts
+    block_e = 128
+    num_assignments = topk_ids.numel()
+    local_fraction_cap = float(
+        os.getenv("SGLANG_NVFP4_DG_COMPACT_LOCAL_FRACTION", "1.0")
+    )
+    if not 0.0 < local_fraction_cap <= 1.0:
+        raise ValueError(
+            "SGLANG_NVFP4_DG_COMPACT_LOCAL_FRACTION must be in (0, 1]"
+        )
+    # Tiny warmup/decode batches have high sampling variance and can put every
+    # route on one EP rank even when the long-prefill distribution is balanced.
+    # Their full-capacity buffers are small, so keep them exact and apply the
+    # trained local-fraction cap only to sufficiently large prefill batches.
+    full_capacity_below = int(
+        os.getenv("SGLANG_NVFP4_DG_COMPACT_FULL_CAP_BELOW", "4096")
+    )
+    if num_assignments <= full_capacity_below:
+        max_local_assignments = num_assignments
+    else:
+        max_local_assignments = min(
+            num_assignments,
+            int(num_assignments * local_fraction_cap + 0.999999),
+        )
+    # Each non-empty expert may add at most BLOCK_E-1 alignment rows.
+    all_tokens = ceil_div(
+        max_local_assignments
+        + min(num_assignments, num_local_experts) * (block_e - 1),
+        block_e,
+    ) * block_e
+
+    tokens_per_expert, unused_masked_dst = fused_moe_dispatch_index(
+        topk_ids,
+        num_local_experts,
+        1,
+        expert_start=expert_start,
+    )
+    dispose_tensor(unused_masked_dst)
+    valid_tokens_per_expert = tokens_per_expert
+    tokens_per_expert = (
+        ceil_div(tokens_per_expert, block_e) * block_e
+    ).to(torch.int32)
+    static_rows_by_layer = _get_nvfp4_static_rows_by_layer()
+    static_rows_num_tokens = int(
+        os.getenv("SGLANG_NVFP4_DG_STATIC_ROWS_NUM_TOKENS", "2048")
+    )
+    if static_rows_num_tokens <= 0:
+        raise ValueError(
+            "SGLANG_NVFP4_DG_STATIC_ROWS_NUM_TOKENS must be positive, got "
+            f"{static_rows_num_tokens}"
+        )
+    if static_rows_by_layer and num_tokens == static_rows_num_tokens:
+        layer_id = runner_config.layer_id
+        if layer_id is None or layer_id not in static_rows_by_layer:
+            raise ValueError(
+                "Missing graph-safe NVFP4 contiguous capacity for MoE layer "
+                f"{layer_id}; configured layers={sorted(static_rows_by_layer)}"
+            )
+        # Learned from the maximum aligned routed-expert load for this layer
+        # over the formal p0.8 and p0.9 workloads. A Python integer keeps both
+        # the allocation and the DeepGEMM launch shape CUDA-graph safe.
+        all_tokens = static_rows_by_layer[layer_id]
+        if get_bool_env_var("SGLANG_NVFP4_DG_ADAPT_CAPTURE_ROWS"):
+            if _bcg_current_capture_var.get() is None:
+                # Breakable-CG runs two eager warmups before recording. A
+                # scalar read is legal there and gives the exact aligned route
+                # rows produced by the capture-only dummy input. Preserve one
+                # extra block as a deterministic safety margin, then reuse the
+                # Python integer while the CUDA stream is actually capturing.
+                exact_rows = max(block_e, int(tokens_per_expert.sum().item()))
+                capture_rows = exact_rows + block_e
+                previous_rows = _nvfp4_capture_rows_by_layer.get(layer_id, 0)
+                if capture_rows > previous_rows:
+                    _nvfp4_capture_rows_by_layer[layer_id] = capture_rows
+                    logger.warning(
+                        "NVFP4 capture capacity: layer=%d trained_rows=%d "
+                        "warmup_rows=%d capture_rows=%d",
+                        layer_id,
+                        static_rows_by_layer[layer_id],
+                        exact_rows,
+                        capture_rows,
+                    )
+                all_tokens = max(all_tokens, capture_rows)
+            else:
+                all_tokens = max(
+                    all_tokens,
+                    _nvfp4_capture_rows_by_layer.get(layer_id, all_tokens),
+                )
+    elif get_bool_env_var("SGLANG_NVFP4_DG_COMPACT_EXACT_ROWS"):
+        # CUDA graphs are disabled for this prefill deployment. Paying one
+        # scalar synchronization here lets the two grouped GEMMs skip the
+        # conservative tail instead of executing thousands of padded rows on
+        # every MoE layer.
+        all_tokens = max(block_e, int(tokens_per_expert.sum().item()))
+    if get_bool_env_var("SGLANG_NVFP4_DG_LOG_CAPACITY"):
+        shape_key = (
+            runner_config.layer_id,
+            num_assignments,
+            num_local_experts,
+            all_tokens,
+        )
+        if shape_key not in _nvfp4_compact_logged_shapes:
+            _nvfp4_compact_logged_shapes.add(shape_key)
+            logger.warning(
+                "NVFP4 compact capacity: layer=%s assignments=%d local_experts=%d "
+                "fraction=%.4f max_local=%d allocated_rows=%d "
+                "valid_local=%d aligned_local=%d nonempty=%d max_expert=%d",
+                runner_config.layer_id,
+                num_assignments,
+                num_local_experts,
+                local_fraction_cap,
+                max_local_assignments,
+                all_tokens,
+                int(valid_tokens_per_expert.sum().item()),
+                int(tokens_per_expert.sum().item()),
+                int((valid_tokens_per_expert > 0).sum().item()),
+                int(valid_tokens_per_expert.max().item()),
+            )
+    torch._assert_async(
+        tokens_per_expert.sum() <= all_tokens,
+        "NVFP4 compact local-route capacity exceeded; increase "
+        "SGLANG_NVFP4_DG_COMPACT_LOCAL_FRACTION",
+    )
+    tokens_per_expert[-1].add_(all_tokens - tokens_per_expert.sum())
+
+    packed_hidden = hidden_states.shape[1]
+    raw_scale = hidden_states_scale.view(num_tokens, -1)
+    if packed_hidden % raw_scale.shape[1]:
+        raise ValueError(
+            "NVFP4 packed activation/scale widths are incompatible: "
+            f"data={packed_hidden}, scale={raw_scale.shape[1]}"
+        )
+    packed_quant_block = packed_hidden // raw_scale.shape[1]
+    if packed_quant_block != 8:
+        raise ValueError(
+            "NVFP4 compact scatter expects one scale per 16 logical values, "
+            f"got packed quant block {packed_quant_block}"
+        )
+
+    packed_input_storage = torch.empty(
+        (all_tokens, packed_hidden),
+        device=hidden_states.device,
+        dtype=torch.uint8,
+    )
+    packed_scale_raw = torch.empty(
+        (all_tokens, raw_scale.shape[1]),
+        device=hidden_states.device,
+        dtype=raw_scale.dtype,
+    )
+    expert_start_loc = torch.empty(
+        num_local_experts, device=hidden_states.device, dtype=torch.int32
+    )
+    m_indices = torch.empty(
+        all_tokens, device=hidden_states.device, dtype=torch.int32
+    )
+    src2dst = torch.empty_like(topk_ids, dtype=torch.int32)
+    ep_scatter(
+        hidden_states,
+        raw_scale,
+        topk_ids,
+        tokens_per_expert,
+        valid_tokens_per_expert,
+        expert_start_loc,
+        packed_input_storage,
+        packed_scale_raw,
+        m_indices,
+        src2dst,
+        scale_ue8m0=False,
+        quant_block_size=packed_quant_block,
+        expert_start=expert_start,
+    )
+    packed_input_scale = transform_ue4m3_sf_into_required_layout(
+        packed_scale_raw.view(torch.float8_e4m3fn), all_tokens
+    )
+    dispose_tensor(packed_scale_raw)
+
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+    running_state["hidden_states_shape"] = (num_tokens, packed_hidden * 2)
+    running_state["hidden_states_dtype"] = torch.bfloat16
+    running_state["hidden_states_device"] = hidden_states.device
+    running_state["src2dst"] = src2dst
+    running_state["all_tokens"] = all_tokens
+    running_state["nvfp4_contiguous"] = True
+    running_state["nvfp4_m_indices"] = m_indices
+    running_state["nvfp4_compact_masked_m"] = torch.full(
+        (1,), all_tokens, device=hidden_states.device, dtype=torch.int32
+    )
+
+    return DeepGemmRunnerInput(
+        hidden_states=packed_input_storage.view(torch.int8),
+        hidden_states_scale=packed_input_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+        hidden_states_scale_tma_aligned=True,
+    )
+
+
 @register_pre_permute("standard", "deep_gemm")
 def pre_permute_standard_to_deep_gemm(
     dispatch_output: StandardDispatchOutput,
@@ -903,6 +1626,22 @@ def pre_permute_standard_to_deep_gemm(
     hidden_states_ref = hidden_states
 
     topk_weights, topk_ids = topk_weights, topk_ids
+
+    if quant_info.is_nvfp4_experts:
+        expert_start = (
+            expert_start
+            if expert_start
+            else get_parallel().moe_ep_rank * runner_config.num_local_experts
+        )
+        return _pre_permute_nvfp4_dispatch_to_deep_gemm_contiguous(
+            hidden_states,
+            dispatch_output.hidden_states_scale,
+            topk_output,
+            quant_info,
+            runner_config,
+            running_state,
+            expert_start,
+        )
 
     if _should_use_masked_standard_layout(runner_config, quant_info, hidden_states):
         output_dtype = (
@@ -1082,6 +1821,18 @@ def pre_permute_flashinfer_to_deep_gemm(
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 
+    if quant_info.is_nvfp4_experts:
+        expert_start = get_parallel().moe_ep_rank * runner_config.num_local_experts
+        return _pre_permute_nvfp4_dispatch_to_deep_gemm_contiguous(
+            dispatch_output.hidden_states,
+            dispatch_output.hidden_states_scale,
+            dispatch_output.topk_output,
+            quant_info,
+            runner_config,
+            running_state,
+            expert_start,
+        )
+
     if dispatch_output.hidden_states.dtype != torch.bfloat16:
         raise TypeError(
             "FlashInfer A2A + DeepGEMM requires a BF16 dispatch payload, got "
@@ -1135,21 +1886,60 @@ def post_permute_deep_gemm_to_standard(
         output = torch.empty(
             hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
         )
-    post_reorder_deepgemm(
-        runner_output.hidden_states,
-        output,
-        src2dst,
-        topk_ids,
-        topk_weights,
-        runner_config.top_k,
-        hidden_states_shape[0],
-        hidden_states_shape[1],
-        (
-            runner_config.routed_scaling_factor
-            if runner_config.routed_scaling_factor is not None
-            else 1.0
-        ),
+    routed_scaling_factor = (
+        runner_config.routed_scaling_factor
+        if runner_config.routed_scaling_factor is not None
+        else 1.0
     )
+    if quant_info.is_nvfp4_experts:
+        assert quant_info.g2_alphas is not None
+        block_size = 1024
+        grid = (
+            hidden_states_shape[0],
+            ceil_div(hidden_states_shape[1], block_size),
+        )
+        if running_state.get("nvfp4_contiguous", False):
+            m_indices = running_state["nvfp4_m_indices"]
+            _nvfp4_post_reorder_alpha_contiguous_kernel[grid](
+                runner_output.hidden_states,
+                output,
+                src2dst,
+                topk_weights,
+                m_indices,
+                quant_info.g2_alphas,
+                runner_config.top_k,
+                hidden_states_shape[1],
+                float(routed_scaling_factor),
+                BLOCK_SIZE=block_size,
+                num_warps=8,
+            )
+        else:
+            _nvfp4_post_reorder_alpha_kernel[grid](
+                runner_output.hidden_states,
+                output,
+                src2dst,
+                topk_weights,
+                quant_info.g2_alphas,
+                runner_config.top_k,
+                hidden_states_shape[0],
+                hidden_states_shape[1],
+                runner_output.hidden_states.shape[1],
+                float(routed_scaling_factor),
+                BLOCK_SIZE=block_size,
+                num_warps=8,
+            )
+    else:
+        post_reorder_deepgemm(
+            runner_output.hidden_states,
+            output,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            runner_config.top_k,
+            hidden_states_shape[0],
+            hidden_states_shape[1],
+            routed_scaling_factor,
+        )
     dispose_tensor(runner_output.hidden_states)
 
     return StandardCombineInput(

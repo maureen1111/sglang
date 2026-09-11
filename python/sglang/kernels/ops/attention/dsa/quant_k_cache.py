@@ -1,6 +1,14 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+
+# This is deliberately opt-in because rounding every per-128 KV scale up to a
+# power of two changes quantization error.  The matching reader switch lives in
+# flash_mla_sm120.py; enabling only one side would be numerically incorrect.
+_USE_POW2_KV_SCALE = os.getenv("SGLANG_DSA_POW2_KV", "0") == "1"
 
 
 def quantize_k_cache(cache_k):
@@ -182,6 +190,7 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
         DIM_ROPE=dim_rope,
         FP8_MIN=torch.finfo(torch.float8_e4m3fn).min,
         FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+        USE_POW2_KV_SCALE=_USE_POW2_KV_SCALE,
     )
 
     return output
@@ -258,6 +267,7 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
         DIM_ROPE=dim_rope,
         FP8_MIN=torch.finfo(torch.float8_e4m3fn).min,
         FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+        USE_POW2_KV_SCALE=_USE_POW2_KV_SCALE,
     )
 
     # Add middle dimension for compatibility with set_mla_kv_buffer_triton
@@ -282,6 +292,7 @@ def _quantize_k_cache_fast_kernel(
     DIM_ROPE: tl.constexpr,
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    USE_POW2_KV_SCALE: tl.constexpr,
 ):
     token_id = tl.program_id(0).to(tl.int64)
     raw_block_id = tl.program_id(1)
@@ -296,8 +307,13 @@ def _quantize_k_cache_fast_kernel(
 
         y = tl.load(ptr, mask=mask, other=0.0).to(tl.float32)
 
-        # the ref impl do not have a `tl.maximum(... eps)`, so we remove it here
         y_s = tl.max(tl.abs(y)) / FP8_MAX
+        if USE_POW2_KV_SCALE:
+            # The SM120 FlashInfer sparse-MLA kernel can fold an E8M0-like
+            # power-of-two K scale into one MMA pass.  Clamp zero blocks before
+            # log2; the value is the smallest normal FP32 number.
+            y_s = tl.maximum(y_s, 1.1754944e-38)
+            y_s = tl.exp2(tl.ceil(tl.log2(y_s)))
         y_s_inv = 1.0 / y_s
         y_q = tl.clamp(y * y_s_inv, FP8_MIN, FP8_MAX).to(
             output_nope_q_ptr.dtype.element_ty

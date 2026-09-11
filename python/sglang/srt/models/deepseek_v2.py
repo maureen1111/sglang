@@ -749,11 +749,17 @@ class DeepseekV2MoE(nn.Module):
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
+            shared_expert_quant_config = quant_config
+            if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_SHARED_EXPERT.get():
+                shared_expert_quant_config = Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    weight_block_size=[128, 128],
+                )
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                quant_config=shared_expert_quant_config,
                 reduce_results=False,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 prefix=add_prefix("shared_experts", prefix),
@@ -1885,7 +1891,7 @@ class DeepseekV2AttentionMLA(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=self._get_o_proj_quant_config(quant_config),
             reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
@@ -2298,6 +2304,15 @@ class DeepseekV2AttentionMLA(
         else:
             return quant_config
 
+    @staticmethod
+    def _get_o_proj_quant_config(quant_config):
+        if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN_O_PROJ.get():
+            return Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[128, 128],
+            )
+        return quant_config
+
 
 class DeepseekV2DecoderLayer(nn.Module):
 
@@ -2388,11 +2403,17 @@ class DeepseekV2DecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
+            dense_mlp_quant_config = quant_config
+            if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_DENSE_MLP.get():
+                dense_mlp_quant_config = Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    weight_block_size=[128, 128],
+                )
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                quant_config=dense_mlp_quant_config,
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,

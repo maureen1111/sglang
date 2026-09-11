@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -72,6 +73,18 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+_ENABLE_SM120_ABSORB_BMM = os.environ.get("SGLANG_ENABLE_SM120_ABSORB_BMM", "0") == "1"
+_ENABLE_SM120_ABSORB_BMM_PRECONCAT = (
+    os.environ.get("SGLANG_ENABLE_SM120_ABSORB_BMM_PRECONCAT", "0") == "1"
+)
+
+if _ENABLE_SM120_ABSORB_BMM:
+    from sglang.srt.models.deepseek_common.attention_forward_methods.sm120_absorb_bmm import (
+        can_use_sm120_absorb_bmm,
+        can_use_sm120_absorb_bmm_preconcat,
+        sm120_absorb_bmm,
+        sm120_absorb_bmm_preconcat,
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -463,6 +476,7 @@ class DeepseekMLAForwardMixin:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
         _kvb_q = None
+        sm120_preconcat_pending = False
         born_q_backend = None
         if (
             _ENABLE_DSA_Q8KV8_BORN_FP8_Q
@@ -553,7 +567,29 @@ class DeepseekMLAForwardMixin:
                         torch.bfloat16,
                     )
             else:
-                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+                q_nope_t = q_nope.transpose(0, 1)
+                if (
+                    _ENABLE_SM120_ABSORB_BMM_PRECONCAT
+                    and forward_batch.forward_mode.is_extend()
+                    and q_pe is not None
+                    and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                    and not is_kv_b_lora_active(self)
+                    and can_use_sm120_absorb_bmm(q_nope_t, self.w_kc)
+                ):
+                    # Defer the BMM until RoPE is ready.  The placeholder is
+                    # overwritten before attention and keeps the common code
+                    # below structurally unchanged.
+                    q_nope_out = q_nope_t
+                    sm120_preconcat_pending = True
+                elif _ENABLE_SM120_ABSORB_BMM and can_use_sm120_absorb_bmm(
+                    q_nope_t, self.w_kc
+                ):
+                    q_nope_out = q_nope.new_empty(
+                        (self.num_local_heads, q_nope.shape[0], self.kv_lora_rank)
+                    )
+                    sm120_absorb_bmm(q_nope_t, self.w_kc, q_nope_out)
+                else:
+                    q_nope_out = torch.bmm(q_nope_t, self.w_kc)
 
             q_nope_out = q_nope_out.transpose(0, 1)
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -573,6 +609,23 @@ class DeepseekMLAForwardMixin:
             and not self._q8kv8_qprep_overlap_pending
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        if sm120_preconcat_pending:
+            if can_use_sm120_absorb_bmm_preconcat(
+                q_nope.transpose(0, 1), self.w_kc, q_pe
+            ):
+                q_nope_out = sm120_absorb_bmm_preconcat(
+                    q_nope.transpose(0, 1), self.w_kc, q_pe
+                )
+                # DSA interprets q_rope=None as an already concatenated Q.
+                q_pe = None
+            else:
+                # Preserve the exact v267 fallback for an unexpected layout.
+                q_nope_out_h = q_nope.new_empty(
+                    (self.num_local_heads, q_nope.shape[0], self.kv_lora_rank)
+                )
+                sm120_absorb_bmm(q_nope.transpose(0, 1), self.w_kc, q_nope_out_h)
+                q_nope_out = q_nope_out_h.transpose(0, 1)
 
         if born_q_backend is not None:
             # Born-fp8 q (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): one fused
@@ -892,13 +945,22 @@ class DeepseekMLAForwardMixin:
                     dtype=attn_output.dtype,
                     device=attn_output.device,
                 )
-                torch.bmm(
-                    attn_output.transpose(0, 1),
-                    self.w_vc,
-                    out=attn_bmm_output.view(
-                        -1, self.num_local_heads, self.v_head_dim
-                    ).transpose(0, 1),
-                )
+                attn_output_t = attn_output.transpose(0, 1)
+                attn_bmm_output_view = attn_bmm_output.view(
+                    -1, self.num_local_heads, self.v_head_dim
+                ).transpose(0, 1)
+                if _ENABLE_SM120_ABSORB_BMM and can_use_sm120_absorb_bmm(
+                    attn_output_t, self.w_vc
+                ):
+                    sm120_absorb_bmm(
+                        attn_output_t, self.w_vc, attn_bmm_output_view
+                    )
+                else:
+                    torch.bmm(
+                        attn_output_t,
+                        self.w_vc,
+                        out=attn_bmm_output_view,
+                    )
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_v_apply,

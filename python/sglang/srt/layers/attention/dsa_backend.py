@@ -1950,8 +1950,8 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
             )
 
-        # Do absorbed multi-latent attention (MLA path)
-        assert q_rope is not None
+        # Do absorbed multi-latent attention (MLA path).  An opt-in
+        # SM120 path may pass an already concatenated Q via q with q_rope=None.
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:

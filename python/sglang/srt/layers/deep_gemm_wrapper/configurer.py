@@ -18,9 +18,10 @@ def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
     if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
         return False
-    # DeepGEMM requires TMEM/tcgen05 (SM100+datacenter), not available on SM120
-    if sm_version == 120:
-        return False
+    # The DeepGEMM package bundled in this image contains the SM120
+    # F8F8BF16 masked-grouped implementation used by the NVFP4 adapter.
+    # Keep the normal import/env checks below; do not blanket-disable the
+    # backend solely because this is a GeForce-family Blackwell device.
     if not (_is_cuda or _is_musa):
         return False
 

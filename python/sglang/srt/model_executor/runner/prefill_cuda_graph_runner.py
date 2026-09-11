@@ -1316,6 +1316,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         def _slot(name):
             return registry.get_slot(name).slice_for(bs, num_tokens)
 
+        # The registry is zero-initialized. Repeating token 0 for every row
+        # makes MoE routing during CUDA-graph capture pathologically hot and
+        # can exceed capacities learned from real prefill traffic. Seed the
+        # capture-only input buffer with a deterministic, diverse token
+        # sequence. Replay refreshes this same buffer from the live batch, so
+        # this does not alter serving inputs or expert top-k semantics.
+        capture_input_ids = _slot("input_ids")
+        capture_input_ids.copy_(
+            torch.arange(
+                num_tokens, device=self.device, dtype=capture_input_ids.dtype
+            ).mul_(7919).add_(17).remainder_(
+                self.model_runner.model_config.vocab_size
+            )
+        )
+
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:

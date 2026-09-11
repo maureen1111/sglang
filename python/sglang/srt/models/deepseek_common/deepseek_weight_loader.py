@@ -796,6 +796,10 @@ class DeepseekV2WeightLoaderMixin:
                         partial_names.append(
                             f"model.layers.{layer_id}.self_attn.{stem}"
                         )
+                if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN_O_PROJ.get():
+                    partial_names.append(
+                        f"model.layers.{layer_id}.self_attn.o_proj"
+                    )
 
                 if enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
                     expert_sub_names = ["shared_experts"] + [
@@ -813,6 +817,29 @@ class DeepseekV2WeightLoaderMixin:
                         for stem in attn_quant_modules:
                             partial_names.append(
                                 f"model.layers.{layer_id}.self_attn.{stem}"
+                            )
+
+                if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN_O_PROJ.get():
+                    for layer_id in range(self.config.num_hidden_layers):
+                        partial_names.append(
+                            f"model.layers.{layer_id}.self_attn.o_proj"
+                        )
+
+                if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_DENSE_MLP.get():
+                    for layer_id in range(self.config.first_k_dense_replace):
+                        for stem in ["gate_proj", "up_proj", "down_proj"]:
+                            partial_names.append(
+                                f"model.layers.{layer_id}.mlp.{stem}"
+                            )
+
+                if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_SHARED_EXPERT.get():
+                    for layer_id in range(
+                        self.config.first_k_dense_replace,
+                        self.config.num_hidden_layers,
+                    ):
+                        for stem in ["gate_proj", "up_proj", "down_proj"]:
+                            partial_names.append(
+                                f"model.layers.{layer_id}.mlp.shared_experts.{stem}"
                             )
 
         # Early return if no quantization needed - avoid materializing all weights into memory
